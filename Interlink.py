@@ -374,7 +374,7 @@ def delete_user_from_json(user_id: str):
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents, owner_id=1391659740492337193, help_command=None)
+bot = commands.Bot(command_prefix='!', intents=intents, owner_id=1386710352426959011, help_command=None)
 
 # --- FLASK WEB SERVER SETUP ---
 app = Flask(__name__)
@@ -3047,6 +3047,7 @@ if __name__ == '__main__':
         print("🔄 Keeping web server alive...")
         while True:
             time.sleep(60)
+
 
 
 
