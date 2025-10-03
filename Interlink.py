@@ -1237,53 +1237,111 @@ class ChannelNameModal(discord.ui.Modal, title="Nhập Tên Kênh Cần Tìm"):
         
         await interaction.followup.send(embed=embed)
         
-# --- View để lấy ID kênh (Đã sửa lỗi phân trang) ---
-class GetChannelIdView(discord.ui.View):
+# --- View để lấy ID kênh (PHIÊN BẢN NÂNG CẤP VỚI PHÂN TRANG) ---
+class GetIdPaginatedView(discord.ui.View):
     def __init__(self, author: discord.User, guilds: list[discord.Guild]):
-        super().__init__(timeout=300)
+        super().__init__(timeout=600)
         self.author = author
-        self.guilds = guilds
+        self.all_guilds = guilds
+        
+        # Chia danh sách server thành các trang, mỗi trang 25 server
+        self.guild_pages = [self.all_guilds[i:i + 25] for i in range(0, len(self.all_guilds), 25)]
+        
+        # Theo dõi trạng thái
+        self.current_page = 0
         self.selected_guild_ids = set()
-        
-        # Chia danh sách server thành các phần nhỏ, mỗi phần tối đa 25
-        guild_chunks = [self.guilds[i:i + 25] for i in range(0, len(self.guilds), 25)]
 
-        # Tạo một menu cho mỗi phần
-        for index, chunk in enumerate(guild_chunks):
-            self.add_item(self.create_guild_select(chunk, index, len(guild_chunks)))
+        # Dựng giao diện ban đầu
+        self.update_view()
 
-    def create_guild_select(self, guild_chunk: list[discord.Guild], page_index: int, total_pages: int):
-        options = [discord.SelectOption(label=g.name, value=str(g.id)) for g in guild_chunk]
-        placeholder = f"Bước 1: Chọn Server (Trang {page_index + 1}/{total_pages})"
-        select = discord.ui.Select(placeholder=placeholder, options=options, min_values=1, max_values=len(options))
+    def update_view(self):
+        """Xóa và dựng lại toàn bộ giao diện dựa trên trạng thái hiện tại."""
+        self.clear_items()
+
+        # --- Menu Chọn Server ---
+        current_options = [
+            discord.SelectOption(
+                label=g.name, 
+                value=str(g.id),
+                default=(g.id in self.selected_guild_ids) # Đánh dấu server đã chọn
+            ) 
+            for g in self.guild_pages[self.current_page]
+        ]
         
-        async def callback(interaction: discord.Interaction):
+        placeholder = f"Bước 1: Chọn Server (Trang {self.current_page + 1}/{len(self.guild_pages)})"
+        
+        guild_select = discord.ui.Select(
+            placeholder=placeholder, 
+            min_values=0, # Cho phép bỏ chọn tất cả
+            max_values=len(current_options), 
+            options=current_options, 
+            row=0
+        )
+        
+        async def guild_callback(interaction: discord.Interaction):
             if interaction.user.id != self.author.id: return
-
-            # Cập nhật tập hợp các ID đã chọn
-            ids_in_this_menu = {int(opt.value) for opt in select.options}
-            self.selected_guild_ids.difference_update(ids_in_this_menu)
+            
+            # Xóa các lựa chọn cũ từ trang này để xử lý việc bỏ chọn
+            ids_on_this_page = {int(opt.value) for opt in current_options}
+            self.selected_guild_ids.difference_update(ids_on_this_page)
+            
+            # Thêm các lựa chọn mới
             for gid in interaction.data["values"]:
                 self.selected_guild_ids.add(int(gid))
+                
+            # Cập nhật lại giao diện
+            self.update_view()
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send(f"✅ Đã cập nhật! Hiện đã chọn **{len(self.selected_guild_ids)}** server.", ephemeral=True)
 
-            await interaction.response.send_message(f"✅ Đã cập nhật lựa chọn server.", ephemeral=True)
-        
-        select.callback = callback
-        return select
+        guild_select.callback = guild_callback
+        self.add_item(guild_select)
 
-    @discord.ui.button(label="Bước 2: Nhập Tên Kênh & Lấy ID", style=discord.ButtonStyle.primary, emoji="🔎")
-    async def open_name_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.author.id: return
-        if not self.selected_guild_ids:
-            return await interaction.response.send_message("Lỗi: Vui lòng chọn ít nhất một Server từ menu.", ephemeral=True)
-        
-        # Lấy các đối tượng guild từ các ID đã chọn
-        selected_guilds = [g for g in self.guilds if g.id in self.selected_guild_ids]
-        
-        # Mở Modal để người dùng nhập tên kênh (Dòng này giờ sẽ hoạt động)
-        modal = ChannelNameModal(selected_guilds)
-        await interaction.response.send_modal(modal)
+        # --- Nút Điều Hướng Server ---
+        if len(self.guild_pages) > 1:
+            prev_button = discord.ui.Button(label="◀️ Trang Trước", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page == 0))
+            next_button = discord.ui.Button(label="Trang Tiếp ▶️", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page >= len(self.guild_pages) - 1))
 
+            async def prev_callback(interaction: discord.Interaction):
+                if interaction.user.id != self.author.id: return
+                self.current_page -= 1
+                self.update_view()
+                await interaction.response.edit_message(view=self)
+            
+            async def next_callback(interaction: discord.Interaction):
+                if interaction.user.id != self.author.id: return
+                self.current_page += 1
+                self.update_view()
+                await interaction.response.edit_message(view=self)
+            
+            prev_button.callback = prev_callback
+            next_button.callback = next_callback
+            self.add_item(prev_button)
+            self.add_item(next_button)
+            
+        # --- Nút Hành Động Cuối Cùng ---
+        button_label = f"Bước 2: Nhập Tên Kênh ({len(self.selected_guild_ids)} server)"
+        proceed_button = discord.ui.Button(
+            label=button_label,
+            style=discord.ButtonStyle.primary,
+            emoji="🔎",
+            row=2,
+            disabled=(not self.selected_guild_ids) # Vô hiệu hóa nếu chưa chọn server
+        )
+        
+        async def proceed_callback(interaction: discord.Interaction):
+            if interaction.user.id != self.author.id: return
+            
+            # Lấy các đối tượng guild từ các ID đã chọn
+            selected_guilds = [g for g in self.all_guilds if g.id in self.selected_guild_ids]
+            
+            # Mở Modal để người dùng nhập tên kênh
+            modal = ChannelNameModal(selected_guilds)
+            await interaction.response.send_modal(modal)
+
+        proceed_button.callback = proceed_callback
+        self.add_item(proceed_button)
+        
 # --- DISCORD BOT EVENTS ---
 @bot.event
 async def on_ready():
@@ -1873,14 +1931,38 @@ async def remove(ctx, user_to_remove: discord.User):
 @commands.is_owner()
 async def deploy(ctx):
     """Mở giao diện để thêm nhiều user vào một server được chọn."""
-    agent_data = jsonbin_storage.read_data()
-    agents = [
-        {'id': uid, 'username': data.get('username', 'N/A')}
-        for uid, data in agent_data.items() if isinstance(data, dict)
-    ]
+    full_data = jsonbin_storage.read_data()
+    if not full_data:
+        return await ctx.send("Không có điệp viên nào trong mạng lưới để triển khai.")
+
+    # Tách danh sách thứ tự và dữ liệu điệp viên
+    roster_order = full_data.pop('_roster_order', None)
+    agent_data = {uid: data for uid, data in full_data.items() if isinstance(data, dict)}
+    
+    # --- Logic sắp xếp mới cho Deploy ---
+    agents = []
+    if roster_order:
+        # Sắp xếp theo thứ tự đã lưu
+        ordered_ids = set()
+        for uid in roster_order:
+            if uid in agent_data:
+                data = agent_data[uid]
+                agents.append({'id': uid, 'username': data.get('username', 'N/A')})
+                ordered_ids.add(uid)
+        
+        # Thêm các điệp viên mới (chưa có trong danh sách thứ tự) vào cuối
+        for uid, data in agent_data.items():
+            if uid not in ordered_ids:
+                agents.append({'id': uid, 'username': data.get('username', 'N/A')})
+    else:
+        # Nếu không có thứ tự, tạo danh sách theo mặc định
+        agents = [
+            {'id': uid, 'username': data.get('username', 'N/A')}
+            for uid, data in agent_data.items()
+        ]
 
     if not agents:
-        return await ctx.send("Không có điệp viên nào trong mạng lưới để triển khai.")
+        return await ctx.send("Không có dữ liệu điệp viên hợp lệ để triển khai.")
 
     guilds = sorted(bot.guilds, key=lambda g: g.me.joined_at)
     
@@ -1902,15 +1984,15 @@ async def getid(ctx):
     # Sắp xếp danh sách server theo ngày bot tham gia (từ cũ nhất -> mới nhất)
     sorted_guilds = sorted(bot.guilds, key=lambda g: g.me.joined_at)
     
-    # Truyền danh sách đã sắp xếp vào View
-    view = GetChannelIdView(ctx.author, sorted_guilds)
+    # Truyền danh sách đã sắp xếp vào View mới
+    view = GetIdPaginatedView(ctx.author, sorted_guilds)
     
     embed = discord.Embed(
         title="🔎 Công Cụ Tìm ID Kênh",
         description="Sử dụng menu bên dưới để chọn server và nhập tên kênh cần tìm.",
         color=discord.Color.purple()
     )
-    await ctx.send(embed=embed, view=view)
+    await ctx.send(embed=embed, view=view)    
 
 @bot.command(name='setupadmin', help='(Chủ bot) Tạo và cấp vai trò quản trị cho một thành viên trên tất cả các server.')
 @commands.is_owner()
@@ -3047,6 +3129,7 @@ if __name__ == '__main__':
         print("🔄 Keeping web server alive...")
         while True:
             time.sleep(60)
+
 
 
 
