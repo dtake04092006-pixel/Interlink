@@ -264,7 +264,6 @@ class ChannelTracker(commands.Cog):
         await self.bot.wait_until_ready()
 
     @commands.command(name='track', help='Theo dõi hoạt động của một kênh.')
-    @commands.is_owner()
     async def track(self, ctx: commands.Context):
         embed = discord.Embed(
             title="🛰️ Thiết lập Theo dõi Kênh",
@@ -275,7 +274,6 @@ class ChannelTracker(commands.Cog):
         await ctx.send(embed=embed, view=view)
 
     @commands.command(name='untrack', help='Ngừng theo dõi hoạt động của một kênh.')
-    @commands.is_owner()
     async def untrack(self, ctx: commands.Context, channel: discord.TextChannel):
         tracked_channels_data = await self.bot.loop.run_in_executor(None, get_tracked_channels_data)
         
