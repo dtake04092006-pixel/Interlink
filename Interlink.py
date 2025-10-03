@@ -2015,46 +2015,67 @@ async def getid(ctx):
     )
     await ctx.send(embed=embed, view=view)    
 
-@bot.command(name='invitebot', help='Tạo link mời cho một bot khác.')
-@commands.has_permissions(manage_guild=True)     # Chỉ người có quyền "Quản lý Server" mới được dùng
-async def invite_bot(ctx, bot_id: int):
+@bot.command(name='invitebot', help='Tạo link mời cho một hoặc nhiều bot.')
+@commands.has_permissions(manage_guild=True)
+async def invite_bot(ctx, *, bot_ids: str):
     """
-    Tạo link mời OAuth2 cho một bot với ID được cung cấp.
-    Link này yêu cầu người dùng tự chọn quyền khi mời để đảm bảo an toàn.
+    Tạo link mời cho một danh sách các ID bot được cung cấp.
+    Các ID phải được phân cách bằng dấu cách.
     """
-    try:
-        # Tạo link mời cơ bản nhất, không yêu cầu sẵn quyền hạn nào.
-        # Người mời sẽ tự tay chọn các quyền trên giao diện của Discord.
-        permissions = discord.Permissions() # Tương đương permissions=0
+    # Tách chuỗi đầu vào thành một danh sách các ID
+    id_list = bot_ids.split()
+    
+    valid_ids = []
+    invalid_ids = []
+
+    # Kiểm tra xem mỗi ID có phải là số hợp lệ không
+    for bot_id in id_list:
+        if bot_id.isdigit():
+            valid_ids.append(int(bot_id))
+        else:
+            invalid_ids.append(bot_id)
+
+    if not valid_ids:
+        return await ctx.send("❌ Không tìm thấy ID bot hợp lệ nào trong danh sách bạn cung cấp.")
+
+    embed = discord.Embed(
+        title="🔗 Tạo Link Mời Bot",
+        description="Dưới đây là các link mời cho những bot bạn đã yêu cầu.",
+        color=discord.Color.blue()
+    )
+
+    # Tạo link cho từng ID hợp lệ
+    for bot_id in valid_ids:
+        permissions = discord.Permissions() # permissions=0 để người mời tự chọn
         invite_url = discord.utils.oauth_url(
             client_id=bot_id,
             permissions=permissions,
-            scopes=("bot",) # Chỉ định đây là một ứng dụng bot
+            scopes=("bot",)
+        )
+        embed.add_field(
+            name=f"🤖 Bot ID: {bot_id}",
+            value=f"[Nhấp vào đây để mời]({invite_url})",
+            inline=False
         )
 
-        embed = discord.Embed(
-            title=f"🔗 Link mời cho Bot ID: {bot_id}",
-            description=(
-                f"Đây là link để mời bot vào server. "
-                f"**Chỉ những người có quyền 'Quản lý Server' mới có thể sử dụng link này.**\n\n"
-                f"➡️ [Nhấp vào đây để mời bot]({invite_url})"
-            ),
-            color=discord.Color.blue()
+    if invalid_ids:
+        embed.add_field(
+            name="⚠️ ID không hợp lệ đã bị bỏ qua",
+            value=", ".join(invalid_ids),
+            inline=False
         )
-        await ctx.send(embed=embed)
+    
+    embed.set_footer(text="Lưu ý: Bạn sẽ cần tự chọn server trong giao diện của Discord cho mỗi link.")
 
-    except Exception as e:
-        await ctx.send(f"Đã xảy ra lỗi: ID bot không hợp lệ hoặc có lỗi khác. Chi tiết: {e}")
+    await ctx.send(embed=embed)
 
 @invite_bot.error
 async def invite_bot_error(ctx, error):
-    """Xử lý các lỗi thường gặp cho lệnh invite_bot."""
+    """Xử lý lỗi cho lệnh invite_bot."""
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("🚫 Bạn không có quyền 'Quản lý Server' để sử dụng lệnh này.")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send("❌ Vui lòng nhập một ID bot hợp lệ (chỉ bao gồm số).")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("❌ Sai cú pháp! Vui lòng nhập ID của bot bạn muốn mời.\n**Ví dụ:** `!invitebot 888888888888888888`")
+        await ctx.send("❌ Sai cú pháp! Vui lòng nhập ID của bot bạn muốn mời.\n**Ví dụ (một bot):** `!invitebot 11111111`\n**Ví dụ (nhiều bot):** `!invitebot 1111 2222 3333`")
         
 @bot.command(name='setupadmin', help='(Chủ bot) Tạo và cấp vai trò quản trị cho một thành viên trên tất cả các server.')
 @commands.is_owner()
@@ -3191,6 +3212,7 @@ if __name__ == '__main__':
         print("🔄 Keeping web server alive...")
         while True:
             time.sleep(60)
+
 
 
 
