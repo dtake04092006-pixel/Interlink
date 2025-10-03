@@ -1,124 +1,106 @@
 # channel_tracker.py
-# Module (Cog) để theo dõi hoạt động của các kênh Discord.
-# Phiên bản 4: Sửa lỗi logic, thông báo khi kênh hoạt động trở lại và tiếp tục theo dõi.
+# Module (Cog) để theo dõi hoạt động của kênh, sử dụng JSONBin.io để lưu trữ.
+# Phiên bản 5: Loại bỏ hoàn toàn sự phụ thuộc vào PostgreSQL.
 
 import discord
 from discord.ext import commands, tasks
-import psycopg2
+import requests # Sử dụng requests để tương tác với JSONBin
 import os
 from datetime import datetime, timedelta, timezone
+import json
 
-# --- Các hàm tương tác với Database (Synchronous) ---
-DATABASE_URL = os.getenv('DATABASE_URL')
+# --- Các hàm tương tác với JSONBin.io (Synchronous) ---
+JSONBIN_API_KEY = os.getenv('JSONBIN_API_KEY')
+JSONBIN_BIN_ID = os.getenv('JSONBIN_BIN_ID')
+JSONBIN_HEADERS = {
+    "Content-Type": "application/json",
+    "X-Master-Key": JSONBIN_API_KEY,
+    "X-Access-Key": JSONBIN_API_KEY
+}
+JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
 
-def db_connect():
-    """Kết nối tới database."""
+def storage_read_data():
+    """Đọc toàn bộ dữ liệu từ JSONBin."""
+    if not all([JSONBIN_API_KEY, JSONBIN_BIN_ID]):
+        print("[Tracker] Lỗi: Thiếu thông tin cấu hình JSONBin.")
+        return {}
     try:
-        return psycopg2.connect(DATABASE_URL, sslmode='require')
+        response = requests.get(f"{JSONBIN_URL}/latest", headers=JSONBIN_HEADERS)
+        if response.status_code == 200:
+            return response.json().get('record', {})
+        print(f"[Tracker] Lỗi khi đọc JSONBin: {response.status_code} - {response.text}")
+        return {}
     except Exception as e:
-        print(f"[Tracker] Lỗi kết nối database: {e}")
-        return None
+        print(f"[Tracker] Lỗi ngoại lệ khi đọc JSONBin: {e}")
+        return {}
 
-def init_tracker_db():
-    """Tạo hoặc cập nhật bảng 'tracked_channels' để có cột trạng thái."""
-    conn = db_connect()
-    if conn:
-        try:
-            with conn.cursor() as cur:
-                # Tạo bảng nếu chưa có, thêm cột is_inactive để theo dõi trạng thái
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS tracked_channels (
-                        channel_id BIGINT PRIMARY KEY,
-                        guild_id BIGINT NOT NULL,
-                        user_id BIGINT NOT NULL,
-                        notification_channel_id BIGINT NOT NULL,
-                        added_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-                        is_inactive BOOLEAN DEFAULT FALSE NOT NULL
-                    );
-                """)
-                # Cố gắng thêm cột is_inactive nếu bảng đã tồn tại từ phiên bản cũ
-                # Lệnh này sẽ không báo lỗi nếu cột đã tồn tại
-                try:
-                    cur.execute("ALTER TABLE tracked_channels ADD COLUMN is_inactive BOOLEAN DEFAULT FALSE NOT NULL;")
-                    print("[Tracker] Nâng cấp thành công: Đã thêm cột 'is_inactive' vào database.")
-                except psycopg2.errors.DuplicateColumn:
-                    # Cột đã tồn tại, bỏ qua
-                    pass
-                conn.commit()
-            print("[Tracker] Bảng 'tracked_channels' trong database đã sẵn sàng.")
-        finally:
-            conn.close()
+def storage_write_data(data):
+    """Ghi toàn bộ dữ liệu vào JSONBin."""
+    if not all([JSONBIN_API_KEY, JSONBIN_BIN_ID]):
+        return False
+    try:
+        response = requests.put(JSONBIN_URL, json=data, headers=JSONBIN_HEADERS)
+        if response.status_code == 200:
+            return True
+        print(f"[Tracker] Lỗi khi ghi JSONBin: {response.status_code} - {response.text}")
+        return False
+    except Exception as e:
+        print(f"[Tracker] Lỗi ngoại lệ khi ghi JSONBin: {e}")
+        return False
 
-def db_add_channel(channel_id, guild_id, user_id, notification_channel_id):
-    """Thêm một kênh vào database, reset trạng thái về 'đang hoạt động'."""
-    conn = db_connect()
-    if conn:
-        try:
-            with conn.cursor() as cur:
-                # Khi thêm hoặc cập nhật, luôn đặt is_inactive = FALSE
-                cur.execute(
-                    """
-                    INSERT INTO tracked_channels (channel_id, guild_id, user_id, notification_channel_id, is_inactive)
-                    VALUES (%s, %s, %s, %s, FALSE)
-                    ON CONFLICT (channel_id) DO UPDATE SET
-                        user_id = EXCLUDED.user_id,
-                        notification_channel_id = EXCLUDED.notification_channel_id,
-                        is_inactive = FALSE;
-                    """,
-                    (channel_id, guild_id, user_id, notification_channel_id)
-                )
-                conn.commit()
-        finally:
-            conn.close()
+# --- Các hàm quản lý dữ liệu theo dõi (trên nền JSONBin) ---
+# Các hàm này sẽ thao tác với key 'tracked_channels' trong bin của bạn
 
-def db_remove_channel(channel_id):
-    """Xóa một kênh khỏi database."""
-    conn = db_connect()
-    if conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM tracked_channels WHERE channel_id = %s;", (channel_id,))
-                conn.commit()
-        finally:
-            conn.close()
+def get_tracked_channels_data():
+    """Lấy riêng phần dữ liệu của các kênh đang theo dõi."""
+    full_data = storage_read_data()
+    return full_data.get('tracked_channels', {})
 
-def db_get_all_tracked():
-    """Lấy danh sách tất cả các kênh đang được theo dõi và trạng thái của chúng."""
-    conn = db_connect()
-    if conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT channel_id, guild_id, user_id, notification_channel_id, is_inactive FROM tracked_channels;")
-                results = cur.fetchall()
-                return results
-        finally:
-            conn.close()
-    return []
+def add_tracked_channel(channel_id, guild_id, user_id, notification_channel_id):
+    """Thêm hoặc cập nhật một kênh vào danh sách theo dõi."""
+    full_data = storage_read_data()
+    if 'tracked_channels' not in full_data:
+        full_data['tracked_channels'] = {}
+    
+    full_data['tracked_channels'][str(channel_id)] = {
+        'guild_id': guild_id,
+        'user_id': user_id,
+        'notification_channel_id': notification_channel_id,
+        'is_inactive': False # Luôn reset về False khi thêm mới hoặc cập nhật
+    }
+    storage_write_data(full_data)
 
-def db_update_channel_status(channel_id, is_now_inactive: bool):
-    """Cập nhật trạng thái 'is_inactive' cho một kênh."""
-    conn = db_connect()
-    if conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE tracked_channels SET is_inactive = %s WHERE channel_id = %s;", (is_now_inactive, channel_id))
-                conn.commit()
-        finally:
-            conn.close()
+def remove_tracked_channel(channel_id):
+    """Xóa một kênh khỏi danh sách theo dõi."""
+    full_data = storage_read_data()
+    if 'tracked_channels' in full_data and str(channel_id) in full_data['tracked_channels']:
+        del full_data['tracked_channels'][str(channel_id)]
+        storage_write_data(full_data)
 
-# Chạy khởi tạo/cập nhật DB một lần khi bot load module này
-init_tracker_db()
+def get_all_tracked_for_check():
+    """Lấy danh sách kênh để kiểm tra, định dạng giống phiên bản DB cũ."""
+    tracked_data = get_tracked_channels_data()
+    # Chuyển đổi dict thành list of tuples để tương thích với logic cũ
+    # (channel_id, guild_id, user_id, notification_channel_id, is_inactive)
+    return [
+        (int(cid), data['guild_id'], data['user_id'], data['notification_channel_id'], data['is_inactive'])
+        for cid, data in tracked_data.items()
+    ]
 
-# --- Các thành phần UI (Views, Modals) ---
+def update_tracked_channel_status(channel_id, is_now_inactive: bool):
+    """Cập nhật trạng thái cho một kênh."""
+    full_data = storage_read_data()
+    if 'tracked_channels' in full_data and str(channel_id) in full_data['tracked_channels']:
+        full_data['tracked_channels'][str(channel_id)]['is_inactive'] = is_now_inactive
+        storage_write_data(full_data)
+
+# --- Các thành phần UI (Views, Modals) - Không thay đổi ---
 
 class TrackByIDModal(discord.ui.Modal, title="Theo dõi bằng ID Kênh"):
-    """Modal để người dùng nhập ID của kênh muốn theo dõi."""
     channel_id_input = discord.ui.TextInput(
         label="ID của kênh cần theo dõi",
         placeholder="Dán ID của kênh văn bản vào đây...",
-        required=True,
-        min_length=17,
-        max_length=20
+        required=True, min_length=17, max_length=20
     )
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -132,8 +114,9 @@ class TrackByIDModal(discord.ui.Modal, title="Theo dõi bằng ID Kênh"):
         if not isinstance(channel_to_track, discord.TextChannel):
             return await interaction.response.send_message("Không tìm thấy kênh văn bản với ID này hoặc bot không có quyền truy cập.", ephemeral=True)
         
+        # Thay thế lệnh gọi DB bằng lệnh gọi hàm mới
         await bot.loop.run_in_executor(
-            None, db_add_channel, channel_to_track.id, channel_to_track.guild.id, interaction.user.id, interaction.channel_id
+            None, add_tracked_channel, channel_to_track.id, channel_to_track.guild.id, interaction.user.id, interaction.channel_id
         )
 
         embed = discord.Embed(
@@ -141,12 +124,10 @@ class TrackByIDModal(discord.ui.Modal, title="Theo dõi bằng ID Kênh"):
             description=f"Thành công! Bot sẽ theo dõi kênh {channel_to_track.mention} trong server **{channel_to_track.guild.name}**.",
             color=discord.Color.green()
         )
-        embed.set_footer(text=f"Cảnh báo sẽ được gửi về kênh này nếu kênh không hoạt động.")
+        embed.set_footer(text="Cảnh báo sẽ được gửi về kênh này nếu kênh không hoạt động.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
 class TrackByNameModal(discord.ui.Modal, title="Theo dõi kênh trên mọi Server"):
-    """Modal để người dùng nhập tên kênh và bot sẽ tìm trên tất cả server."""
     channel_name_input = discord.ui.TextInput(
         label="Nhập chính xác tên kênh cần theo dõi",
         placeholder="Ví dụ: general, announcements, v.v.",
@@ -158,20 +139,20 @@ class TrackByNameModal(discord.ui.Modal, title="Theo dõi kênh trên mọi Serv
         bot = interaction.client
         channel_name = self.channel_name_input.value.strip().lower().replace('-', ' ')
 
-        found_channels = []
-        for guild in bot.guilds:
-            if guild.get_member(interaction.user.id):
-                target_channel = discord.utils.get(guild.text_channels, name=channel_name)
-                if target_channel:
-                    found_channels.append(target_channel)
+        found_channels = [
+            target_channel
+            for guild in bot.guilds
+            if guild.get_member(interaction.user.id)
+            and (target_channel := discord.utils.get(guild.text_channels, name=channel_name))
+        ]
 
         if not found_channels:
-            await interaction.followup.send(f"Không tìm thấy kênh nào tên `{self.channel_name_input.value}` trong các server bạn có mặt.", ephemeral=True)
-            return
+            return await interaction.followup.send(f"Không tìm thấy kênh nào tên `{self.channel_name_input.value}` trong các server bạn có mặt.", ephemeral=True)
 
         for channel in found_channels:
+            # Thay thế lệnh gọi DB bằng lệnh gọi hàm mới
             await bot.loop.run_in_executor(
-                None, db_add_channel, channel.id, channel.guild.id, interaction.user.id, interaction.channel_id
+                None, add_tracked_channel, channel.id, channel.guild.id, interaction.user.id, interaction.channel_id
             )
 
         server_list_str = "\n".join([f"• **{c.guild.name}**" for c in found_channels])
@@ -184,11 +165,9 @@ class TrackByNameModal(discord.ui.Modal, title="Theo dõi kênh trên mọi Serv
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 class TrackInitialView(discord.ui.View):
-    """View ban đầu với hai lựa chọn: theo dõi bằng ID hoặc Tên."""
-    def __init__(self, author_id: int, bot: commands.Bot):
+    def __init__(self, author_id: int):
         super().__init__(timeout=180)
         self.author_id = author_id
-        self.bot = bot
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -210,28 +189,32 @@ class ChannelTracker(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.inactivity_threshold_minutes = int(os.getenv('INACTIVITY_THRESHOLD_MINUTES', 7 * 24 * 60))
-        self.check_activity.start()
+        if not all([JSONBIN_API_KEY, JSONBIN_BIN_ID]):
+            print("[Tracker] VÔ HIỆU HÓA: Không tìm thấy JSONBIN_API_KEY hoặc JSONBIN_BIN_ID.")
+        else:
+            self.check_activity.start()
 
     def cog_unload(self):
         self.check_activity.cancel()
 
     @tasks.loop(minutes=30)
     async def check_activity(self):
-        print(f"[{datetime.now()}] [Tracker] Bắt đầu kiểm tra trạng thái kênh...")
+        print(f"[{datetime.now()}] [Tracker] Bắt đầu kiểm tra trạng thái kênh bằng JSONBin...")
         
-        tracked_channels_data = await self.bot.loop.run_in_executor(None, db_get_all_tracked)
+        # Thay thế lệnh gọi DB
+        tracked_channels_data = await self.bot.loop.run_in_executor(None, get_all_tracked_for_check)
         
         for channel_id, guild_id, user_id, notification_channel_id, was_inactive in tracked_channels_data:
             notification_channel = self.bot.get_channel(notification_channel_id)
             if not notification_channel:
-                print(f"[Tracker] LỖI: Không tìm thấy kênh thông báo {notification_channel_id}, xóa kênh {channel_id} khỏi DB.")
-                await self.bot.loop.run_in_executor(None, db_remove_channel, channel_id)
+                print(f"[Tracker] LỖI: Không tìm thấy kênh thông báo {notification_channel_id}, xóa kênh {channel_id} khỏi theo dõi.")
+                await self.bot.loop.run_in_executor(None, remove_tracked_channel, channel_id)
                 continue
 
             channel_to_track = self.bot.get_channel(channel_id)
             if not channel_to_track:
-                print(f"[Tracker] Kênh {channel_id} không tồn tại, đang xóa khỏi DB.")
-                await self.bot.loop.run_in_executor(None, db_remove_channel, channel_id)
+                print(f"[Tracker] Kênh {channel_id} không tồn tại, đang xóa khỏi theo dõi.")
+                await self.bot.loop.run_in_executor(None, remove_tracked_channel, channel_id)
                 continue
             
             try:
@@ -246,11 +229,11 @@ class ChannelTracker(commands.Cog):
                 # KỊCH BẢN 1: Kênh vừa mới trở nên không hoạt động
                 if is_currently_inactive and not was_inactive:
                     print(f"[Tracker] Kênh {channel_id} đã không hoạt động. Gửi cảnh báo.")
-                    await self.bot.loop.run_in_executor(None, db_update_channel_status, channel_id, True)
+                    await self.bot.loop.run_in_executor(None, update_tracked_channel_status, channel_id, True)
                     
                     embed = discord.Embed(
                         title="⚠️ Cảnh báo Kênh không hoạt động",
-                        description=f"Kênh {channel_to_track.mention} tại **{channel_to_track.guild.name}** đã không có tin nhắn mới trong hơn **{self.inactivity_threshold_minutes}** phút.",
+                        description=f"Kênh {channel_to_track.mention} tại **{channel_to_track.guild.name}** đã không có tin nhắn mới trong hơn **{self.inactivity_threshold_minutes // (24*60)}** ngày.",
                         color=discord.Color.orange()
                     )
                     embed.add_field(name="Lần hoạt động cuối", value=f"<t:{int(last_activity_time.timestamp())}:R>", inline=False)
@@ -260,7 +243,7 @@ class ChannelTracker(commands.Cog):
                 # KỊCH BẢN 2: Kênh đã hoạt động trở lại
                 elif not is_currently_inactive and was_inactive:
                     print(f"[Tracker] Kênh {channel_id} đã hoạt động trở lại. Gửi thông báo.")
-                    await self.bot.loop.run_in_executor(None, db_update_channel_status, channel_id, False)
+                    await self.bot.loop.run_in_executor(None, update_tracked_channel_status, channel_id, False)
 
                     embed = discord.Embed(
                         title="✅ Kênh đã hoạt động trở lại",
@@ -268,7 +251,7 @@ class ChannelTracker(commands.Cog):
                         color=discord.Color.green()
                     )
                     embed.add_field(name="Hoạt động gần nhất", value=f"<t:{int(last_activity_time.timestamp())}:R>", inline=False)
-                    embed.set_footer(text=f"Bot sẽ tiếp tục theo dõi kênh này.")
+                    embed.set_footer(text="Bot sẽ tiếp tục theo dõi kênh này.")
                     await notification_channel.send(content=f"Cập nhật cho {mention}:", embed=embed)
             
             except discord.Forbidden:
@@ -281,34 +264,25 @@ class ChannelTracker(commands.Cog):
         await self.bot.wait_until_ready()
 
     @commands.command(name='track', help='Theo dõi hoạt động của một kênh.')
+    @commands.is_owner()
     async def track(self, ctx: commands.Context):
         embed = discord.Embed(
             title="🛰️ Thiết lập Theo dõi Kênh",
-            description="Chọn phương thức bạn muốn dùng để xác định kênh cần theo dõi.",
+            description="Chọn phương thức bạn muốn dùng để xác định kênh cần theo dõi. Dữ liệu sẽ được lưu trên JSONBin.",
             color=discord.Color.blue()
         )
-        view = TrackInitialView(author_id=ctx.author.id, bot=self.bot)
+        view = TrackInitialView(author_id=ctx.author.id)
         await ctx.send(embed=embed, view=view)
 
     @commands.command(name='untrack', help='Ngừng theo dõi hoạt động của một kênh.')
-    async def untrack(self, ctx: commands.Context, channel: discord.TextChannel = None):
-        if channel is None:
-            await ctx.send("Vui lòng gắn thẻ kênh bạn muốn ngừng theo dõi. Ví dụ: `!untrack #tên-kênh`", ephemeral=True)
-            return
-    
-        tracked_channels_data = await self.bot.loop.run_in_executor(None, db_get_all_tracked)
-        tracked_channel = next((tc for tc in tracked_channels_data if tc[0] == channel.id), None)
+    @commands.is_owner()
+    async def untrack(self, ctx: commands.Context, channel: discord.TextChannel):
+        tracked_channels_data = await self.bot.loop.run_in_executor(None, get_tracked_channels_data)
         
-        if not tracked_channel:
-            await ctx.send(f"Kênh {channel.mention} hiện không được theo dõi.", ephemeral=True)
-            return
+        if str(channel.id) not in tracked_channels_data:
+            return await ctx.send(f"Kênh {channel.mention} hiện không được theo dõi.", ephemeral=True)
             
-        user_id_who_added = tracked_channel[2]
-        if user_id_who_added != ctx.author.id and not ctx.author.guild_permissions.manage_channels:
-            await ctx.send("Bạn không có quyền ngừng theo dõi kênh này.", ephemeral=True)
-            return
-    
-        await self.bot.loop.run_in_executor(None, db_remove_channel, channel.id)
+        await self.bot.loop.run_in_executor(None, remove_tracked_channel, channel.id)
         
         embed = discord.Embed(
             title="✅ Dừng theo dõi", description=f"Đã ngừng theo dõi kênh {channel.mention}.", color=discord.Color.red()
