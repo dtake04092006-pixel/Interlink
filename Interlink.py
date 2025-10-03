@@ -165,12 +165,33 @@ class JSONBinStorage:
         return self.write_data(data)
 
     def delete_user(self, user_id):
-        """Xóa một user khỏi JSONBin"""
-        data = self.read_data()
-        if str(user_id) in data:
-            del data[str(user_id)]
-            return self.write_data(data)
-        return True # Trả về True nếu user không tồn tại sẵn
+        """Xóa một user khỏi JSONBin, bao gồm cả trong danh sách thứ tự."""
+        full_data = self.read_data()
+        user_id_str = str(user_id)
+        
+        made_change = False
+
+        # 1. Xóa hồ sơ chính của user
+        if user_id_str in full_data:
+            del full_data[user_id_str]
+            made_change = True
+            print(f"[Storage] Đã xóa hồ sơ chính của user {user_id_str}.")
+
+        # 2. Xóa user khỏi danh sách thứ tự '_roster_order' nếu có
+        if '_roster_order' in full_data:
+            try:
+                full_data['_roster_order'].remove(user_id_str)
+                made_change = True
+                print(f"[Storage] Đã xóa user {user_id_str} khỏi _roster_order.")
+            except ValueError:
+                # User không có trong danh sách thứ tự, không sao cả
+                pass
+        
+        # 3. Chỉ ghi lại vào bin nếu có sự thay đổi
+        if made_change:
+            return self.write_data(full_data)
+        
+        return True # Trả về True nếu không có gì để xóa
 
 # Khởi tạo JSONBin storage
 jsonbin_storage = JSONBinStorage()
@@ -1995,7 +2016,7 @@ async def getid(ctx):
     await ctx.send(embed=embed, view=view)    
 
 @bot.command(name='invitebot', help='Tạo link mời cho một bot khác.')
-@commands.has_permissions(manage_server=True) # Chỉ người có quyền "Quản lý Server" mới được dùng
+@commands.has_permissions(manage_guild=True)     # Chỉ người có quyền "Quản lý Server" mới được dùng
 async def invite_bot(ctx, bot_id: int):
     """
     Tạo link mời OAuth2 cho một bot với ID được cung cấp.
@@ -3170,6 +3191,7 @@ if __name__ == '__main__':
         print("🔄 Keeping web server alive...")
         while True:
             time.sleep(60)
+
 
 
 
