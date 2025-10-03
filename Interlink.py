@@ -1994,6 +1994,47 @@ async def getid(ctx):
     )
     await ctx.send(embed=embed, view=view)    
 
+@bot.command(name='invitebot', help='Tạo link mời cho một bot khác.')
+@commands.has_permissions(manage_server=True) # Chỉ người có quyền "Quản lý Server" mới được dùng
+async def invite_bot(ctx, bot_id: int):
+    """
+    Tạo link mời OAuth2 cho một bot với ID được cung cấp.
+    Link này yêu cầu người dùng tự chọn quyền khi mời để đảm bảo an toàn.
+    """
+    try:
+        # Tạo link mời cơ bản nhất, không yêu cầu sẵn quyền hạn nào.
+        # Người mời sẽ tự tay chọn các quyền trên giao diện của Discord.
+        permissions = discord.Permissions() # Tương đương permissions=0
+        invite_url = discord.utils.oauth_url(
+            client_id=bot_id,
+            permissions=permissions,
+            scopes=("bot",) # Chỉ định đây là một ứng dụng bot
+        )
+
+        embed = discord.Embed(
+            title=f"🔗 Link mời cho Bot ID: {bot_id}",
+            description=(
+                f"Đây là link để mời bot vào server. "
+                f"**Chỉ những người có quyền 'Quản lý Server' mới có thể sử dụng link này.**\n\n"
+                f"➡️ [Nhấp vào đây để mời bot]({invite_url})"
+            ),
+            color=discord.Color.blue()
+        )
+        await ctx.send(embed=embed)
+
+    except Exception as e:
+        await ctx.send(f"Đã xảy ra lỗi: ID bot không hợp lệ hoặc có lỗi khác. Chi tiết: {e}")
+
+@invite_bot.error
+async def invite_bot_error(ctx, error):
+    """Xử lý các lỗi thường gặp cho lệnh invite_bot."""
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("🚫 Bạn không có quyền 'Quản lý Server' để sử dụng lệnh này.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("❌ Vui lòng nhập một ID bot hợp lệ (chỉ bao gồm số).")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("❌ Sai cú pháp! Vui lòng nhập ID của bot bạn muốn mời.\n**Ví dụ:** `!invitebot 888888888888888888`")
+        
 @bot.command(name='setupadmin', help='(Chủ bot) Tạo và cấp vai trò quản trị cho một thành viên trên tất cả các server.')
 @commands.is_owner()
 async def setupadmin(ctx, member_to_grant: discord.Member):
@@ -3129,6 +3170,7 @@ if __name__ == '__main__':
         print("🔄 Keeping web server alive...")
         while True:
             time.sleep(60)
+
 
 
 
