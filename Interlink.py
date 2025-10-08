@@ -1800,18 +1800,14 @@ async def roster(ctx):
             await ctx.send("❌ **Lỗi:** Không tìm thấy hồ sơ điệp viên nào trong mạng.")
             return
 
-        # Tách danh sách thứ tự và dữ liệu điệp viên
-        roster_order = full_data.pop('_roster_order', None)
-        agent_data = full_data
-        
-        # --- Logic sắp xếp mới ---
+        # --- SỬA LỖI: Chỉ lấy các mục có key là số (ID người dùng) ---
+        agent_data = {uid: data for uid, data in full_data.items() if uid.isdigit()}
+        roster_order = full_data.get('_roster_order') # Lấy thứ tự riêng
+
         agents = []
-        
-        # Tạo một set chứa ID của các điệp viên có dữ liệu để kiểm tra nhanh
-        valid_agent_ids = {uid for uid, data in agent_data.items() if isinstance(data, dict)}
+        valid_agent_ids = set(agent_data.keys())
 
         if roster_order:
-            # 1. Thêm các điệp viên theo thứ tự đã lưu
             ordered_ids = set()
             for uid in roster_order:
                 if uid in valid_agent_ids:
@@ -1823,7 +1819,6 @@ async def roster(ctx):
                     })
                     ordered_ids.add(uid)
             
-            # 2. Thêm các điệp viên mới (chưa có trong danh sách thứ tự) vào cuối
             for uid in valid_agent_ids:
                 if uid not in ordered_ids:
                     data = agent_data[uid]
@@ -1833,8 +1828,6 @@ async def roster(ctx):
                         'avatar_hash': data.get('avatar_hash')
                     })
         else:
-            # Nếu không có thứ tự, tạo danh sách theo mặc định
-            print("⚠️ Không tìm thấy `_roster_order`. Tạo danh sách mặc định.")
             for uid, data in agent_data.items():
                 if isinstance(data, dict):
                     agents.append({
@@ -1847,7 +1840,6 @@ async def roster(ctx):
             await ctx.send("❌ **Lỗi:** Không tìm thấy dữ liệu điệp viên hợp lệ.")
             return
         
-        # Khởi tạo và gửi trang đầu tiên
         pagination_view = RosterPages(agents, ctx)
         await pagination_view.send_initial_message()
 
@@ -1953,17 +1945,16 @@ async def remove(ctx, user_to_remove: discord.User):
 async def deploy(ctx):
     """Mở giao diện để thêm nhiều user vào một server được chọn."""
     full_data = jsonbin_storage.read_data()
-    if not full_data:
+    
+    # --- SỬA LỖI: Chỉ lấy các mục có key là số (ID người dùng) ---
+    agent_data = {uid: data for uid, data in full_data.items() if uid.isdigit()}
+    roster_order = full_data.get('_roster_order')
+
+    if not agent_data:
         return await ctx.send("Không có điệp viên nào trong mạng lưới để triển khai.")
 
-    # Tách danh sách thứ tự và dữ liệu điệp viên
-    roster_order = full_data.pop('_roster_order', None)
-    agent_data = {uid: data for uid, data in full_data.items() if isinstance(data, dict)}
-    
-    # --- Logic sắp xếp mới cho Deploy ---
     agents = []
     if roster_order:
-        # Sắp xếp theo thứ tự đã lưu
         ordered_ids = set()
         for uid in roster_order:
             if uid in agent_data:
@@ -1971,19 +1962,14 @@ async def deploy(ctx):
                 agents.append({'id': uid, 'username': data.get('username', 'N/A')})
                 ordered_ids.add(uid)
         
-        # Thêm các điệp viên mới (chưa có trong danh sách thứ tự) vào cuối
         for uid, data in agent_data.items():
             if uid not in ordered_ids:
                 agents.append({'id': uid, 'username': data.get('username', 'N/A')})
     else:
-        # Nếu không có thứ tự, tạo danh sách theo mặc định
         agents = [
             {'id': uid, 'username': data.get('username', 'N/A')}
             for uid, data in agent_data.items()
         ]
-
-    if not agents:
-        return await ctx.send("Không có dữ liệu điệp viên hợp lệ để triển khai.")
 
     guilds = sorted(bot.guilds, key=lambda g: g.me.joined_at)
     
@@ -3212,19 +3198,6 @@ if __name__ == '__main__':
         print("🔄 Keeping web server alive...")
         while True:
             time.sleep(60)
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
