@@ -836,6 +836,182 @@ class DeployView(discord.ui.View):
         deploy_button.callback = deploy_callback
         self.add_item(deploy_button)
 
+class KickView(discord.ui.View):
+    def __init__(self, author: discord.User, guilds: list[discord.Guild], agents: list[dict]):
+        super().__init__(timeout=600)
+        self.author = author
+        self.all_guilds = guilds
+        
+        # Chia dữ liệu thành các trang
+        self.guild_pages = [guilds[i:i + 25] for i in range(0, len(guilds), 25)]
+        self.agent_pages = [agents[i:i + 25] for i in range(0, len(agents), 25)]
+        
+        # Theo dõi trang và lựa chọn hiện tại
+        self.current_guild_page = 0
+        self.current_agent_page = 0
+        self.selected_guild_ids = set()
+        self.selected_user_ids = set()
+
+        self.update_view()
+
+    def update_view(self):
+        """Xóa và dựng lại giao diện dựa trên trạng thái hiện tại."""
+        self.clear_items()
+
+        # --- Menu Chọn Server ---
+        guild_options = [
+            discord.SelectOption(
+                label=g.name, value=str(g.id), default=(g.id in self.selected_guild_ids)
+            ) for g in self.guild_pages[self.current_guild_page]
+        ]
+        guild_placeholder = f"Bước 1: Chọn Server (Trang {self.current_guild_page + 1}/{len(self.guild_pages)})"
+        guild_select = discord.ui.Select(
+            placeholder=guild_placeholder, min_values=0, max_values=len(guild_options), options=guild_options, row=0
+        )
+        async def guild_callback(interaction: discord.Interaction):
+            if interaction.user.id != self.author.id: return
+            ids_on_this_page = {int(opt.value) for opt in guild_options}
+            self.selected_guild_ids.difference_update(ids_on_this_page)
+            for gid in interaction.data["values"]:
+                self.selected_guild_ids.add(int(gid))
+            self.update_view()
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send(f"✅ Đã cập nhật! Hiện đã chọn **{len(self.selected_guild_ids)}** server.", ephemeral=True)
+        guild_select.callback = guild_callback
+        self.add_item(guild_select)
+
+        # --- Nút Điều Hướng & Chọn Tất Cả Server ---
+        # Nút chọn tất cả
+        all_selected = len(self.selected_guild_ids) == len(self.all_guilds)
+        select_all_button = discord.ui.Button(
+            label="Bỏ chọn Tất Cả" if all_selected else "Chọn Tất Cả Server", 
+            style=discord.ButtonStyle.danger if all_selected else discord.ButtonStyle.primary, 
+            row=1
+        )
+        async def select_all_callback(interaction: discord.Interaction):
+            if interaction.user.id != self.author.id: return
+            if all_selected:
+                self.selected_guild_ids.clear()
+            else:
+                self.selected_guild_ids = {g.id for g in self.all_guilds}
+            self.update_view()
+            await interaction.response.edit_message(view=self)
+        select_all_button.callback = select_all_callback
+        self.add_item(select_all_button)
+
+        # Nút phân trang server
+        if len(self.guild_pages) > 1:
+            prev_guild_button = discord.ui.Button(label="◀️ Trước", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_guild_page == 0))
+            next_guild_button = discord.ui.Button(label="Sau ▶️", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_guild_page >= len(self.guild_pages) - 1))
+            async def prev_guild_callback(interaction: discord.Interaction):
+                if interaction.user.id != self.author.id: return
+                self.current_guild_page -= 1; self.update_view()
+                await interaction.response.edit_message(view=self)
+            async def next_guild_callback(interaction: discord.Interaction):
+                if interaction.user.id != self.author.id: return
+                self.current_guild_page += 1; self.update_view()
+                await interaction.response.edit_message(view=self)
+            prev_guild_button.callback = prev_guild_callback
+            next_guild_button.callback = next_guild_callback
+            self.add_item(prev_guild_button)
+            self.add_item(next_guild_button)
+
+        # --- Menu Chọn Agent ---
+        agent_options = [
+            discord.SelectOption(
+                label=str(agent.get('username', agent.get('id'))), value=str(agent.get('id')), default=(int(agent.get('id')) in self.selected_user_ids)
+            ) for agent in self.agent_pages[self.current_agent_page]
+        ]
+        agent_placeholder = f"Bước 2: Chọn Agent để Kick (Trang {self.current_agent_page + 1}/{len(self.agent_pages)})"
+        agent_select = discord.ui.Select(placeholder=agent_placeholder, min_values=0, max_values=len(agent_options), options=agent_options, row=2)
+        async def agent_callback(interaction: discord.Interaction):
+            if interaction.user.id != self.author.id: return
+            ids_on_this_page = {int(opt.value) for opt in agent_options}
+            self.selected_user_ids.difference_update(ids_on_this_page)
+            for uid in interaction.data["values"]:
+                self.selected_user_ids.add(int(uid))
+            self.update_view()
+            await interaction.message.edit(view=self)
+            await interaction.followup.send(f"✅ Đã cập nhật! Hiện đã chọn **{len(self.selected_user_ids)}** agent.", ephemeral=True)
+        agent_select.callback = agent_callback
+        self.add_item(agent_select)
+        
+        # --- Nút Điều Hướng Agent ---
+        if len(self.agent_pages) > 1:
+            prev_agent_button = discord.ui.Button(label="◀️ Trước", style=discord.ButtonStyle.secondary, row=3, disabled=(self.current_agent_page == 0))
+            next_agent_button = discord.ui.Button(label="Sau ▶️", style=discord.ButtonStyle.secondary, row=3, disabled=(self.current_agent_page >= len(self.agent_pages) - 1))
+            async def prev_agent_callback(interaction: discord.Interaction):
+                if interaction.user.id != self.author.id: return
+                self.current_agent_page -= 1; self.update_view()
+                await interaction.response.edit_message(view=self)
+            async def next_agent_callback(interaction: discord.Interaction):
+                if interaction.user.id != self.author.id: return
+                self.current_agent_page += 1; self.update_view()
+                await interaction.response.edit_message(view=self)
+            prev_agent_button.callback = prev_agent_callback
+            next_agent_button.callback = next_agent_callback
+            self.add_item(prev_agent_button)
+            self.add_item(next_agent_button)
+
+        # --- Nút hành động cuối cùng ---
+        button_label = f"Kick ({len(self.selected_user_ids)} agents) khỏi ({len(self.selected_guild_ids)} servers)"
+        kick_button = discord.ui.Button(
+            label=button_label, style=discord.ButtonStyle.danger, emoji="👢", row=4, 
+            disabled=(not self.selected_guild_ids or not self.selected_user_ids)
+        )
+        
+        async def kick_callback(interaction: discord.Interaction):
+            if interaction.user.id != self.author.id: return
+            
+            for item in self.children: item.disabled = True
+            await interaction.response.edit_message(view=self)
+            
+            await interaction.followup.send(
+                f"👢 **Bắt đầu quá trình kick {len(self.selected_user_ids)} agent khỏi {len(self.selected_guild_ids)} server...**"
+            )
+            
+            success_count, fail_count, failed_kicks = 0, 0, []
+            reason = f"Bị kick bởi {interaction.user.name} (ID: {interaction.user.id})"
+            
+            for guild_id in self.selected_guild_ids:
+                guild = bot.get_guild(guild_id)
+                if not guild:
+                    fail_count += len(self.selected_user_ids)
+                    failed_kicks.append(f"Tất cả agents -> Server ID `{guild_id}` (Không tìm thấy server)")
+                    continue
+                    
+                for user_id in self.selected_user_ids:
+                    member_to_kick = guild.get_member(user_id)
+                    if not member_to_kick:
+                        fail_count += 1
+                        failed_kicks.append(f"<@{user_id}> -> `{guild.name}` (Không có trong server)")
+                        continue
+                    
+                    try:
+                        await guild.kick(member_to_kick, reason=reason)
+                        success_count += 1
+                    except discord.Forbidden:
+                        fail_count += 1
+                        failed_kicks.append(f"<@{user_id}> -> `{guild.name}` (Thiếu quyền)")
+                    except Exception as e:
+                        fail_count += 1
+                        failed_kicks.append(f"<@{user_id}> -> `{guild.name}` (Lỗi: {e})")
+            
+            embed = discord.Embed(title="Báo Cáo Kick Hàng Loạt", color=0xff0000)
+            embed.add_field(name="✅ Lượt Kick Thành Công", value=f"{success_count}", inline=True)
+            embed.add_field(name="❌ Lượt Kick Thất Bại", value=f"{fail_count}", inline=True)
+            
+            if failed_kicks:
+                error_details = "\n".join(failed_kicks)
+                if len(error_details) > 1024:
+                    error_details = error_details[:1020] + "\n..."
+                embed.add_field(name="Chi tiết thất bại", value=error_details, inline=False)
+                
+            await interaction.followup.send(embed=embed)
+
+        kick_button.callback = kick_callback
+        self.add_item(kick_button)
+        
 # --- Modal 1: Nhập số lượng kênh ---
 # --- View để chọn số lượng kênh ---
 class QuantityView(discord.ui.View):
@@ -2062,7 +2238,35 @@ async def invite_bot_error(ctx, error):
         await ctx.send("🚫 Bạn không có quyền 'Quản lý Server' để sử dụng lệnh này.")
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("❌ Sai cú pháp! Vui lòng nhập ID của bot bạn muốn mời.\n**Ví dụ (một bot):** `!invitebot 11111111`\n**Ví dụ (nhiều bot):** `!invitebot 1111 2222 3333`")
-        
+
+@bot.command(name='kick', help='(Chủ bot) Mở giao diện kick thành viên khỏi server.')
+@commands.is_owner()
+async def kick(ctx):
+    """Mở giao diện để kick nhiều user khỏi nhiều server được chọn."""
+    full_data = jsonbin_storage.read_data()
+    agent_data = {uid: data for uid, data in full_data.items() if uid.isdigit()}
+
+    if not agent_data:
+        return await ctx.send("Không có agent nào trong mạng lưới để thực hiện kick.")
+
+    agents = [
+        {'id': uid, 'username': data.get('username', 'N/A')}
+        for uid, data in agent_data.items()
+    ]
+    
+    guilds = sorted(bot.guilds, key=lambda g: g.me.joined_at)
+    
+    view = KickView(ctx.author, guilds, agents)
+    
+    embed = discord.Embed(
+        title="👢 Giao Diện Kick Thành Viên",
+        description="Sử dụng các menu bên dưới để chọn server và các agent cần kick.",
+        color=discord.Color.red()
+    )
+    embed.set_footer(text=f"Hiện có {len(agents)} agent trong danh sách.")
+    
+    await ctx.send(embed=embed, view=view)
+    
 @bot.command(name='setupadmin', help='(Chủ bot) Tạo và cấp vai trò quản trị cho một thành viên trên tất cả các server.')
 @commands.is_owner()
 async def setupadmin(ctx, member_to_grant: discord.Member):
@@ -3198,6 +3402,7 @@ if __name__ == '__main__':
         print("🔄 Keeping web server alive...")
         while True:
             time.sleep(60)
+
 
 
 
