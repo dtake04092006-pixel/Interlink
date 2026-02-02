@@ -14,6 +14,8 @@ import time
 from PIL import Image, ImageDraw
 import io
 import aiohttp
+from flask import session, redirect, url_for, render_template_string, jsonify
+import functools
 
 # Try to import psycopg2, fallback to JSONBin if not available
 try:
@@ -30,6 +32,8 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 CLIENT_ID = os.getenv('DISCORD_CLIENT_ID')
 CLIENT_SECRET = os.getenv('DISCORD_CLIENT_SECRET')
 DATABASE_URL = os.getenv('DATABASE_URL')
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123') 
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'super_secret_key_change_me')
 
 # JSONBin.io configuration
 JSONBIN_API_KEY = os.getenv('JSONBIN_API_KEY')  # Thêm vào .env file
@@ -196,6 +200,14 @@ class JSONBinStorage:
 # Khởi tạo JSONBin storage
 jsonbin_storage = JSONBinStorage()
 
+def login_required(f):
+    @functools.wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'logged_in' not in session:
+            return redirect(url_for('admin_login'))
+        return f(*args, **kwargs)
+    return decorated_function
+    
 # --- DATABASE SETUP ---
 def init_database():
     """Khởi tạo database và tạo bảng nếu chưa có"""
@@ -3347,6 +3359,151 @@ def health():
         "users": len(bot.users) if bot.is_ready() else 0
     }
 
+# --- ADMIN DASHBOARD ROUTES (THÊM MỚI) ---
+@app.route('/admin/login', methods=['GET', 'POST'])
+def admin_login():
+    if request.method == 'POST':
+        if request.form.get('password') == ADMIN_PASSWORD:
+            session['logged_in'] = True
+            return redirect(url_for('admin_dashboard'))
+        return "<h3>Sai mật khẩu! <a href='/admin/login'>Thử lại</a></h3>"
+    return '''
+    <body style="background:#111;color:#d4af37;font-family:serif;display:flex;justify-content:center;align-items:center;height:100vh;">
+        <form method="post" style="border:1px solid #d4af37;padding:40px;text-align:center;">
+            <h2>🕵️ ADMIN ACCESS</h2>
+            <input type="password" name="password" placeholder="Passcode" style="padding:10px;">
+            <button type="submit" style="padding:10px;background:#800;color:white;border:none;cursor:pointer;">UNLOCK</button>
+        </form>
+    </body>
+    '''
+
+@app.route('/admin/logout')
+def admin_logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('index'))
+
+@app.route('/admin/dashboard')
+@login_required
+def admin_dashboard():
+    # Đọc dữ liệu từ JSONBin
+    full_data = jsonbin_storage.read_data()
+    agent_data = {uid: data for uid, data in full_data.items() if uid.isdigit()}
+    
+    # Xử lý thứ tự sắp xếp (Roster Order)
+    order = full_data.get('_roster_order', [])
+    agents = []
+    seen = set()
+    
+    # Thêm agents theo thứ tự đã lưu
+    for uid in order:
+        if uid in agent_data:
+            d = agent_data[uid]
+            agents.append({
+                'id': uid, 
+                'username': d.get('username', 'N/A'), 
+                'avatar': f"https://cdn.discordapp.com/avatars/{uid}/{d.get('avatar_hash')}.png" if d.get('avatar_hash') else ""
+            })
+            seen.add(uid)
+            
+    # Thêm các agents còn lại (chưa được sắp xếp)
+    for uid, d in agent_data.items():
+        if uid not in seen:
+            agents.append({
+                'id': uid, 
+                'username': d.get('username', 'N/A'), 
+                'avatar': f"https://cdn.discordapp.com/avatars/{uid}/{d.get('avatar_hash')}.png" if d.get('avatar_hash') else ""
+            })
+            
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Roster Command Center</title>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.14.0/Sortable.min.js"></script>
+        <style>
+            body { background: #1a1a1a; color: #e0e0e0; font-family: sans-serif; padding: 20px; max-width: 800px; margin: 0 auto; }
+            .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #DAA520; padding-bottom: 10px; margin-bottom: 20px; }
+            .btn { padding: 8px 16px; border: none; cursor: pointer; color: white; text-decoration: none; font-weight: bold; }
+            .btn-save { background: #006400; }
+            .btn-del { background: #8B0000; font-size: 0.8em; }
+            .btn-logout { background: #555; }
+            .agent-card { 
+                background: #2c2c2c; border: 1px solid #444; margin-bottom: 8px; padding: 10px; 
+                display: flex; align-items: center; justify-content: space-between; cursor: move;
+            }
+            .agent-info { display: flex; align-items: center; gap: 15px; }
+            .avatar { width: 35px; height: 35px; border-radius: 50%; border: 1px solid #DAA520; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h2 style="color:#DAA520;margin:0;">🕵️ ROSTER COMMAND</h2>
+            <div>
+                <button onclick="saveOrder()" class="btn btn-save">💾 LƯU THỨ TỰ</button>
+                <a href="/admin/logout" class="btn btn-logout">Thoát</a>
+            </div>
+        </div>
+        <div id="roster-list">
+            {% for agent in agents %}
+            <div class="agent-card" data-id="{{ agent.id }}">
+                <div class="agent-info">
+                    <span style="color:#888;">☰</span>
+                    <img src="{{ agent.avatar }}" class="avatar" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">
+                    <div>
+                        <div style="font-weight:bold;color:#DAA520;">{{ agent.username }}</div>
+                        <div style="font-size:0.8em;color:#888;">{{ agent.id }}</div>
+                    </div>
+                </div>
+                <button onclick="deleteAgent('{{ agent.id }}')" class="btn btn-del">🗑️ XÓA</button>
+            </div>
+            {% endfor %}
+        </div>
+        <script>
+            new Sortable(document.getElementById('roster-list'), { animation: 150 });
+
+            async function saveOrder() {
+                const order = Array.from(document.querySelectorAll('.agent-card')).map(e => e.getAttribute('data-id'));
+                const res = await fetch('/admin/api/reorder', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({order: order})
+                });
+                alert((await res.json()).success ? '✅ Đã lưu!' : '❌ Lỗi!');
+            }
+
+            async function deleteAgent(id) {
+                if(!confirm('Xóa sạch dữ liệu của agent này?')) return;
+                const res = await fetch('/admin/api/delete/' + id, { method: 'POST' });
+                if((await res.json()).success) {
+                    document.querySelector(`.agent-card[data-id="${id}"]`).remove();
+                } else {
+                    alert('❌ Lỗi xóa!');
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """, agents=agents)
+
+@app.route('/admin/api/reorder', methods=['POST'])
+@login_required
+def api_reorder():
+    full_data = jsonbin_storage.read_data()
+    full_data['_roster_order'] = request.json.get('order', [])
+    jsonbin_storage.write_data(full_data)
+    return jsonify({"success": True})
+
+@app.route('/admin/api/delete/<uid>', methods=['POST'])
+@login_required
+def api_delete_user(uid):
+    # Gọi các hàm xóa từ các nguồn dữ liệu có sẵn trong file của bạn
+    try: delete_user_from_db(uid) 
+    except: pass
+    try: jsonbin_storage.delete_user(uid)
+    except: pass
+    try: delete_user_from_json(uid)
+    except: pass
+    return jsonify({"success": True})
+    
 # --- THREADING FUNCTION ---
 def run_flask():
     """Chạy Flask server"""
@@ -3402,8 +3559,3 @@ if __name__ == '__main__':
         print("🔄 Keeping web server alive...")
         while True:
             time.sleep(60)
-
-
-
-
-
