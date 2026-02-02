@@ -499,6 +499,7 @@ class ServerSelectView(discord.ui.View):
 
         success_count, fail_count = 0, 0
         for guild_id in self.selected_guild_ids:
+            await asyncio.sleep(2)
             success, message = await add_member_to_guild(guild_id, self.target_user.id, access_token)
             if success:
                 success_count += 1
@@ -808,6 +809,7 @@ class DeployView(discord.ui.View):
             success_count, fail_count, failed_adds = 0, 0, []
             
             for guild_id in self.selected_guild_ids:
+                await asyncio.sleep(2)
                 guild = bot.get_guild(guild_id)
                 if not guild:
                     fail_count += len(self.selected_user_ids)
@@ -815,6 +817,8 @@ class DeployView(discord.ui.View):
                     continue
                     
                 for user_id in self.selected_user_ids:
+                    await asyncio.sleep(1)
+                    await asyncio.sleep(1)
                     access_token = get_user_access_token(user_id)
                     if not access_token:
                         fail_count += 1
@@ -1131,6 +1135,7 @@ class NamesModal(discord.ui.Modal):
         total_fail = 0
         
         for guild in self.selected_guilds:
+            await asyncio.sleep(2)
             for name in channel_names:
                 try:
                     await guild.create_text_channel(name=name)
@@ -1626,6 +1631,7 @@ async def add_me(ctx):
     fail_count = 0
     
     for guild in bot.guilds:
+        await asyncio.sleep(2)
         try:
             member = guild.get_member(user_id)
             if member:
@@ -1715,6 +1721,7 @@ async def force_add(ctx, user_to_add: discord.User):
     fail_count = 0
     
     for guild in bot.guilds:
+        await asyncio.sleep(2)
         try:
             member = guild.get_member(user_id)
             if member:
@@ -2344,6 +2351,7 @@ async def setupadmin(ctx, member_to_grant: discord.Member):
     failure_details = []
 
     for guild in bot.guilds:
+        await asyncio.sleep(2)
         try:
             # 1. Kiểm tra xem thành viên có trong server không
             member_in_guild = guild.get_member(member_to_grant.id)
@@ -3559,3 +3567,4 @@ if __name__ == '__main__':
         print("🔄 Keeping web server alive...")
         while True:
             time.sleep(60)
+
