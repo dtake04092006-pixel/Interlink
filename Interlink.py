@@ -3542,11 +3542,11 @@ if __name__ == '__main__':
     async def setup_hook():
         """Hàm này được gọi tự động trước khi bot đăng nhập."""
         print("🔧 Đang load các module mở rộng (cogs)...")
-        try:
-            await bot.load_extension('channel_tracker') # Tên file mới không có .py
-            print("✅ Đã load thành công module 'channel_tracker'.")
-        except Exception as e:
-            print(f"❌ Lỗi khi load module 'channel_tracker': {e}")
+        #try:
+         #   await bot.load_extension('channel_tracker') # Tên file mới không có .py
+          #  print("✅ Đã load thành công module 'channel_tracker'.")
+        #except Exception as e:
+         #   print(f"❌ Lỗi khi load module 'channel_tracker': {e}")
 
     try:
         # Start Flask server in separate thread
@@ -3566,6 +3566,7 @@ if __name__ == '__main__':
         print("🔄 Keeping web server alive...")
         while True:
             time.sleep(60)
+
 
 
 
