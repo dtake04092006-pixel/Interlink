@@ -1569,11 +1569,11 @@ async def on_ready():
     print(f'🌐 JSONBin.io: {jsonbin_status}')
     
     
-    try:
-        synced = await bot.tree.sync()
+    #try:
+    #    synced = await bot.tree.sync()
         print(f"✅ Đã đồng bộ {len(synced)} lệnh slash.")
-    except Exception as e:
-        print(f"❌ Không thể đồng bộ lệnh slash: {e}")
+    #except Exception as e:
+    #   print(f"❌ Không thể đồng bộ lệnh slash: {e}")
     print('------')
 
 @bot.event
@@ -3566,5 +3566,6 @@ if __name__ == '__main__':
         print("🔄 Keeping web server alive...")
         while True:
             time.sleep(60)
+
 
 
