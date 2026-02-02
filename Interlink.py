@@ -33,7 +33,6 @@ CLIENT_ID = os.getenv('DISCORD_CLIENT_ID')
 CLIENT_SECRET = os.getenv('DISCORD_CLIENT_SECRET')
 DATABASE_URL = os.getenv('DATABASE_URL')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123') 
-app.secret_key = os.getenv('FLASK_SECRET_KEY', 'super_secret_key_change_me')
 
 # JSONBin.io configuration
 JSONBIN_API_KEY = os.getenv('JSONBIN_API_KEY')  # Thêm vào .env file
@@ -411,7 +410,7 @@ bot = commands.Bot(command_prefix='!', intents=intents, owner_id=138671035242695
 
 # --- FLASK WEB SERVER SETUP ---
 app = Flask(__name__)
-
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'super_secret_key_change_me') # <--- DÁN VÀO ĐÂY
 # --- UTILITY FUNCTIONS ---
 async def add_member_to_guild(guild_id: int, user_id: int, access_token: str):
     """Thêm member vào guild sử dụng Discord API trực tiếp"""
@@ -3567,4 +3566,5 @@ if __name__ == '__main__':
         print("🔄 Keeping web server alive...")
         while True:
             time.sleep(60)
+
 
