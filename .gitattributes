@@ -1,0 +1,5 @@
+.gitattributes text eol=lf
+Interlink.py -text whitespace=cr-at-eol
+*.md text eol=lf
+interlink_core.py text eol=lf
+tests/*.py text eol=lf

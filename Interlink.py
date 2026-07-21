@@ -9,13 +9,25 @@ import requests
 from discord.ext import commands
 from flask import Flask, request
 from dotenv import load_dotenv
-from urllib.parse import urlparse
 import time
-from PIL import Image, ImageDraw
+from PIL import Image
 import io
-import aiohttp
 from flask import session, redirect, url_for, render_template_string, jsonify
 import functools
+
+from interlink_core import (
+    AGENT_PAGE_SIZE,
+    HELP_CATEGORY_META,
+    OWNER_IDS_KEY,
+    SERVER_ORDER_KEY,
+    SERVER_PAGE_SIZE,
+    help_commands_for,
+    paginate_items,
+    reconcile_guild_order,
+    replace_page_selection,
+    validate_owner_ids,
+    validate_server_order,
+)
 
 # Try to import psycopg2, fallback to JSONBin if not available
 try:
@@ -60,6 +72,8 @@ class JSONBinStorage:
         self.api_key = JSONBIN_API_KEY
         self.bin_id = JSONBIN_BIN_ID
         self.base_url = "https://api.jsonbin.io/v3"
+        self.request_timeout = 15
+        self._update_lock = threading.RLock()
         
     def _get_headers(self):
         """Tạo headers cho requests"""
@@ -71,6 +85,9 @@ class JSONBinStorage:
     
     def create_bin(self, data=None):
         """Tạo bin mới nếu chưa có"""
+        if not self.api_key:
+            print("❌ Cannot create JSONBin without JSONBIN_API_KEY")
+            return None
         if data is None:
             data = {}
         
@@ -78,7 +95,8 @@ class JSONBinStorage:
             response = requests.post(
                 f"{self.base_url}/b",
                 json=data,
-                headers=self._get_headers()
+                headers=self._get_headers(),
+                timeout=self.request_timeout,
             )
             
             if response.status_code == 200:
@@ -94,35 +112,41 @@ class JSONBinStorage:
             print(f"❌ JSONBin create error: {e}")
             return None
     
-    def read_data(self):
-        """Đọc dữ liệu từ JSONBin"""
-        if not self.bin_id:
-            print("⚠️ No bin ID, creating new bin...")
-            self.create_bin()
-            return {}
-            
+    def read_data_with_status(self):
+        """Read JSONBin data and keep failure distinct from an empty record."""
+        if not self.api_key or not self.bin_id:
+            return False, {}
+
         try:
             response = requests.get(
                 f"{self.base_url}/b/{self.bin_id}/latest",
-                headers=self._get_headers()
+                headers=self._get_headers(),
+                timeout=self.request_timeout,
             )
-            
+
             if response.status_code == 200:
                 data = response.json()
-                return data.get('record', {})
-            elif response.status_code == 404:
-                print("⚠️ Bin not found, creating new one...")
-                self.create_bin()
-                return {}
-            else:
-                print(f"❌ Failed to read from JSONBin: {response.status_code}")
-                return {}
+                record = data.get('record', {})
+                if isinstance(record, dict):
+                    return True, record
+                print("❌ JSONBin record is not a JSON object")
+                return False, {}
+
+            print(f"❌ Failed to read from JSONBin: {response.status_code}")
+            return False, {}
         except Exception as e:
             print(f"❌ JSONBin read error: {e}")
-            return {}
-    
+            return False, {}
+
+    def read_data(self):
+        """Compatibility wrapper returning an empty dict when JSONBin is unavailable."""
+        success, data = self.read_data_with_status()
+        return data if success else {}
+
     def write_data(self, data):
         """Ghi dữ liệu vào JSONBin"""
+        if not self.api_key or not isinstance(data, dict):
+            return False
         if not self.bin_id:
             print("⚠️ No bin ID, creating new bin...")
             if not self.create_bin(data):
@@ -132,7 +156,8 @@ class JSONBinStorage:
             response = requests.put(
                 f"{self.base_url}/b/{self.bin_id}",
                 json=data,
-                headers=self._get_headers()
+                headers=self._get_headers(),
+                timeout=self.request_timeout,
             )
             
             if response.status_code == 200:
@@ -144,7 +169,28 @@ class JSONBinStorage:
         except Exception as e:
             print(f"❌ JSONBin write error: {e}")
             return False
-    
+
+    def update_data(self, updater):
+        """Atomically read-modify-write the latest record within this process."""
+        with self._update_lock:
+            if not self.api_key:
+                return False
+
+            if self.bin_id:
+                success, current = self.read_data_with_status()
+                if not success:
+                    return False
+            else:
+                current = {}
+
+            updated = dict(current)
+            updater(updated)
+            return self.write_data(updated)
+
+    def set_metadata(self, key, value):
+        """Update one metadata key without discarding user records or unknown keys."""
+        return self.update_data(lambda data: data.__setitem__(key, value))
+
     def get_user_token(self, user_id):
         """Lấy token của user từ JSONBin"""
         data = self.read_data()
@@ -156,45 +202,30 @@ class JSONBinStorage:
     
     def save_user_token(self, user_id, access_token, username=None, avatar_hash=None):
         """Lưu token của user vào JSONBin"""
-        data = self.read_data()
-        
-        data[str(user_id)] = {
+        user_data = {
             'access_token': access_token,
             'username': username,
             'avatar_hash': avatar_hash,
-            'updated_at': str(time.time())
+            'updated_at': str(time.time()),
         }
-        
-        return self.write_data(data)
+        return self.update_data(lambda data: data.__setitem__(str(user_id), user_data))
 
     def delete_user(self, user_id):
         """Xóa một user khỏi JSONBin, bao gồm cả trong danh sách thứ tự."""
-        full_data = self.read_data()
         user_id_str = str(user_id)
-        
-        made_change = False
 
-        # 1. Xóa hồ sơ chính của user
-        if user_id_str in full_data:
-            del full_data[user_id_str]
-            made_change = True
-            print(f"[Storage] Đã xóa hồ sơ chính của user {user_id_str}.")
+        with self._update_lock:
+            success, full_data = self.read_data_with_status()
+            if not success:
+                return False
 
-        # 2. Xóa user khỏi danh sách thứ tự '_roster_order' nếu có
-        if '_roster_order' in full_data:
-            try:
-                full_data['_roster_order'].remove(user_id_str)
+            made_change = full_data.pop(user_id_str, None) is not None
+            roster_order = full_data.get('_roster_order')
+            if isinstance(roster_order, list) and user_id_str in roster_order:
+                full_data['_roster_order'] = [uid for uid in roster_order if uid != user_id_str]
                 made_change = True
-                print(f"[Storage] Đã xóa user {user_id_str} khỏi _roster_order.")
-            except ValueError:
-                # User không có trong danh sách thứ tự, không sao cả
-                pass
-        
-        # 3. Chỉ ghi lại vào bin nếu có sự thay đổi
-        if made_change:
-            return self.write_data(full_data)
-        
-        return True # Trả về True nếu không có gì để xóa
+
+            return self.write_data(full_data) if made_change else True
 
 # Khởi tạo JSONBin storage
 jsonbin_storage = JSONBinStorage()
@@ -203,6 +234,8 @@ def login_required(f):
     @functools.wraps(f)
     def decorated_function(*args, **kwargs):
         if 'logged_in' not in session:
+            if request.path.startswith('/admin/api/'):
+                return jsonify({"success": False, "error": "authentication required"}), 401
             return redirect(url_for('admin_login'))
         return f(*args, **kwargs)
     return decorated_function
@@ -406,11 +439,86 @@ def delete_user_from_json(user_id: str):
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents, owner_id=1386710352426959011, help_command=None)
+DEFAULT_OWNER_IDS = ('1386710352426959011',)
+bot = commands.Bot(
+    command_prefix='!',
+    intents=intents,
+    owner_ids={int(owner_id) for owner_id in DEFAULT_OWNER_IDS},
+    help_command=None,
+)
 
 # --- FLASK WEB SERVER SETUP ---
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'super_secret_key_change_me') # <--- DÁN VÀO ĐÂY
+
+_server_order_cache = []
+_server_order_cache_loaded = False
+_server_order_cache_lock = threading.Lock()
+
+
+def set_cached_server_order(order):
+    """Replace the in-process guild order cache with a defensive copy."""
+    global _server_order_cache, _server_order_cache_loaded
+    safe_order = list(order) if isinstance(order, (list, tuple)) else []
+    with _server_order_cache_lock:
+        _server_order_cache = safe_order
+        _server_order_cache_loaded = True
+
+
+def get_cached_server_order():
+    with _server_order_cache_lock:
+        return list(_server_order_cache), _server_order_cache_loaded
+
+
+def normalize_stored_owner_ids(owner_ids):
+    """Return valid configured owners, or the legacy owner as a lockout-safe fallback."""
+    try:
+        return validate_owner_ids(owner_ids)
+    except ValueError:
+        return list(DEFAULT_OWNER_IDS)
+
+
+def set_bot_owner_ids(owner_ids):
+    """Apply a validated owner list immediately to discord.py's permission checks."""
+    normalized_owner_ids = normalize_stored_owner_ids(owner_ids)
+    bot.owner_id = None
+    bot.owner_ids = {int(owner_id) for owner_id in normalized_owner_ids}
+    return normalized_owner_ids
+
+
+def get_bot_owner_ids():
+    owner_ids = getattr(bot, 'owner_ids', None) or set()
+    normalized = [str(owner_id) for owner_id in owner_ids]
+    return sorted(normalized, key=int) or list(DEFAULT_OWNER_IDS)
+
+
+def refresh_server_order_cache():
+    """Refresh ordering metadata from JSONBin without raising into callers."""
+    if not JSONBIN_API_KEY or not JSONBIN_BIN_ID:
+        set_cached_server_order([])
+        return False
+
+    success, full_data = jsonbin_storage.read_data_with_status()
+    if success:
+        set_cached_server_order(full_data.get(SERVER_ORDER_KEY, []))
+        set_bot_owner_ids(full_data.get(OWNER_IDS_KEY))
+        return True
+
+    # Avoid retrying a failed synchronous service call on every Discord command.
+    _, loaded = get_cached_server_order()
+    if not loaded:
+        set_cached_server_order([])
+    return False
+
+
+async def get_ordered_guilds(force_refresh=False):
+    """Return bot guilds in the admin-defined order without blocking the event loop."""
+    _, cache_loaded = get_cached_server_order()
+    if force_refresh or not cache_loaded:
+        await asyncio.to_thread(refresh_server_order_cache)
+    order, _ = get_cached_server_order()
+    return reconcile_guild_order(bot.guilds, order)
+
 # --- UTILITY FUNCTIONS ---
 async def add_member_to_guild(guild_id: int, user_id: int, access_token: str):
     """Thêm member vào guild sử dụng Discord API trực tiếp"""
@@ -423,7 +531,8 @@ async def add_member_to_guild(guild_id: int, user_id: int, access_token: str):
         "access_token": access_token
     }
     
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.put(url, headers=headers, json=data) as response:
             if response.status == 201:
                 return True, "Thêm thành công"
@@ -435,76 +544,148 @@ async def add_member_to_guild(guild_id: int, user_id: int, access_token: str):
                 
 # --- INTERACTIVE UI COMPONENTS ---
 
-# Lớp này định nghĩa giao diện lựa chọn server
-class ServerSelectView(discord.ui.View):
-    def __init__(self, author: discord.User, target_user: discord.User, guilds: list[discord.Guild]):
-        super().__init__(timeout=300)
-        self.author = author
-        self.target_user = target_user
-        self.guilds = guilds
-        self.selected_guild_ids = set()
-
-        # Chia danh sách server thành các phần nhỏ, mỗi phần tối đa 25
-        guild_chunks = [self.guilds[i:i + 25] for i in range(0, len(self.guilds), 25)]
-        
-        # Tạo một menu cho mỗi phần
-        for index, chunk in enumerate(guild_chunks):
-            self.add_item(self.create_server_select(chunk, index, len(guild_chunks)))
-
-    def create_server_select(self, guild_chunk: list[discord.Guild], page_index: int, total_pages: int):
-        options = [discord.SelectOption(label=g.name, value=str(g.id)) for g in guild_chunk]
-        placeholder = f"Chọn server (Trang {page_index + 1}/{total_pages})"
-        
-        select = discord.ui.Select(
-            placeholder=placeholder,
-            options=options,
-            min_values=1,
-            max_values=len(options)
+def build_guild_options(guilds, selected_guild_ids):
+    """Build Discord-safe options while restoring selections on every page."""
+    return [
+        discord.SelectOption(
+            label=str(getattr(guild, 'name', guild.id))[:100],
+            value=str(guild.id),
+            description=f"ID: {guild.id}"[:100],
+            default=(guild.id in selected_guild_ids),
         )
-        
-        async def callback(interaction: discord.Interaction):
-            if interaction.user.id != self.author.id:
-                return await interaction.response.send_message("Bạn không có quyền tương tác.", ephemeral=True)
-            
-            # Cập nhật tập hợp các ID đã chọn
-            ids_in_this_menu = {int(opt.value) for opt in select.options}
-            self.selected_guild_ids.difference_update(ids_in_this_menu)
-            for gid in interaction.data["values"]:
-                self.selected_guild_ids.add(int(gid))
+        for guild in guilds
+    ]
 
-            await interaction.response.send_message(f"✅ Đã cập nhật! Hiện đã chọn **{len(self.selected_guild_ids)}** server.", ephemeral=True)
 
-        select.callback = callback
-        return select
+class AuthorOnlyView(discord.ui.View):
+    """Shared interaction guard for views that belong to one command author."""
+    def __init__(self, author, *, timeout):
+        super().__init__(timeout=timeout)
+        self.author = author
 
-    @discord.ui.button(label="Summon", style=discord.ButtonStyle.green, emoji="✨")
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id == self.author.id:
+            return True
+        await interaction.response.send_message(
+            "❌ Chỉ người tạo lệnh mới có thể sử dụng giao diện này.",
+            ephemeral=True,
+        )
+        return False
+
+
+class ServerSelectView(AuthorOnlyView):
+    """Paginated multi-server selector used by the owner-only invite command."""
+    def __init__(self, author: discord.User, target_user: discord.User, guilds: list[discord.Guild]):
+        super().__init__(author, timeout=300)
+        self.target_user = target_user
+        self.guilds = list(guilds)
+        self.guild_pages = paginate_items(self.guilds, SERVER_PAGE_SIZE)
+        self.current_page = 0
+        self.selected_guild_ids = set()
+        self.guild_select = None
+        self.empty_item = None
+        self._rebuild_select()
+
+    def _current_guilds(self):
+        if not self.guild_pages:
+            return []
+        return self.guild_pages[self.current_page]
+
+    def _refresh_buttons(self):
+        page_count = len(self.guild_pages)
+        self.previous_page.disabled = page_count == 0 or self.current_page == 0
+        self.next_page.disabled = page_count == 0 or self.current_page >= page_count - 1
+        self.summon_button.disabled = not self.selected_guild_ids
+        self.summon_button.label = f"Summon ({len(self.selected_guild_ids)} server)"
+
+    def _rebuild_select(self):
+        if self.guild_select is not None:
+            self.remove_item(self.guild_select)
+            self.guild_select = None
+        if self.empty_item is not None:
+            self.remove_item(self.empty_item)
+            self.empty_item = None
+
+        current_guilds = self._current_guilds()
+        if not current_guilds:
+            self.empty_item = discord.ui.Button(
+                label="Không có server khả dụng",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+                row=0,
+            )
+            self.add_item(self.empty_item)
+            self._refresh_buttons()
+            return
+
+        options = build_guild_options(current_guilds, self.selected_guild_ids)
+        self.guild_select = discord.ui.Select(
+            placeholder=f"Chọn server • Trang {self.current_page + 1}/{len(self.guild_pages)}",
+            options=options,
+            min_values=0,
+            max_values=len(options),
+            row=0,
+        )
+
+        async def select_callback(interaction: discord.Interaction):
+            page_ids = {guild.id for guild in current_guilds}
+            submitted_ids = {int(value) for value in interaction.data.get("values", [])}
+            self.selected_guild_ids = replace_page_selection(
+                self.selected_guild_ids,
+                page_ids,
+                submitted_ids,
+            )
+            self._rebuild_select()
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send(
+                f"✅ Đã cập nhật: **{len(self.selected_guild_ids)}** server được chọn.",
+                ephemeral=True,
+            )
+
+        self.guild_select.callback = select_callback
+        self.add_item(self.guild_select)
+        self._refresh_buttons()
+
+    @discord.ui.button(label="◀ Trang trước", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = max(0, self.current_page - 1)
+        self._rebuild_select()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Trang sau ▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = min(len(self.guild_pages) - 1, self.current_page + 1)
+        self._rebuild_select()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Summon (0 server)", style=discord.ButtonStyle.green, emoji="✨", row=2)
     async def summon_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.author.id:
-            return await interaction.response.send_message("Bạn không có quyền sử dụng nút này.", ephemeral=True)
-        
         if not self.selected_guild_ids:
             return await interaction.response.send_message("Bạn chưa chọn server nào cả!", ephemeral=True)
 
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(view=self)
-        
-        await interaction.followup.send(f"✅ Đã nhận lệnh! Bắt đầu mời **{self.target_user.name}** vào **{len(self.selected_guild_ids)}** server đã chọn...")
 
-        access_token = get_user_access_token(self.target_user.id)
+        await interaction.followup.send(
+            f"✅ Bắt đầu mời **{self.target_user.name}** vào **{len(self.selected_guild_ids)}** server đã chọn..."
+        )
+
+        access_token = await asyncio.to_thread(get_user_access_token, self.target_user.id)
         if not access_token:
             await interaction.followup.send(f"❌ Người dùng **{self.target_user.name}** chưa ủy quyền cho bot.")
             return
 
         success_count, fail_count = 0, 0
-        for guild_id in self.selected_guild_ids:
+        ordered_selected_ids = [guild.id for guild in self.guilds if guild.id in self.selected_guild_ids]
+        for guild_id in ordered_selected_ids:
             await asyncio.sleep(2)
-            success, message = await add_member_to_guild(guild_id, self.target_user.id, access_token)
+            success, _ = await add_member_to_guild(guild_id, self.target_user.id, access_token)
             if success:
                 success_count += 1
             else:
                 fail_count += 1
-        
+
         embed = discord.Embed(title=f"📊 Kết quả mời {self.target_user.name}", color=0x00ff00)
         embed.add_field(name="✅ Thành công", value=f"{success_count} server", inline=True)
         embed.add_field(name="❌ Thất bại", value=f"{fail_count} server", inline=True)
@@ -647,14 +828,13 @@ class RosterPages(discord.ui.View):
         await self.update_buttons()
         await interaction.response.edit_message(embed=embed, attachments=[file], view=self)
 
-class DeployView(discord.ui.View):
+class DeployView(AuthorOnlyView):
     def __init__(self, author: discord.User, guilds: list[discord.Guild], agents: list[dict]):
-        super().__init__(timeout=600) # Tăng thời gian chờ
-        self.author = author
+        super().__init__(author, timeout=600)
         
         # Chia dữ liệu thành các trang
-        self.guild_pages = [guilds[i:i + 25] for i in range(0, len(guilds), 25)]
-        self.agent_pages = [agents[i:i + 25] for i in range(0, len(agents), 25)]
+        self.guild_pages = paginate_items(guilds, SERVER_PAGE_SIZE)
+        self.agent_pages = paginate_items(agents, AGENT_PAGE_SIZE)
         
         # Theo dõi trang hiện tại
         self.current_guild_page = 0
@@ -671,16 +851,17 @@ class DeployView(discord.ui.View):
         """Xóa các thành phần cũ và dựng lại giao diện dựa trên trang hiện tại."""
         self.clear_items() # Xóa tất cả các nút và menu cũ
 
+        if not self.guild_pages or not self.agent_pages:
+            self.add_item(discord.ui.Button(
+                label="Không có đủ dữ liệu server/agent",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+            ))
+            return
+
         # --- Tạo menu chọn Server ---
-        guild_options = [
-            discord.SelectOption(
-                label=g.name, 
-                value=str(g.id), 
-                # *** THAY ĐỔI 2: Đánh dấu các server đã được chọn trong set ***
-                default=(g.id in self.selected_guild_ids)
-            ) 
-            for g in self.guild_pages[self.current_guild_page]
-        ]
+        current_guilds = self.guild_pages[self.current_guild_page]
+        guild_options = build_guild_options(current_guilds, self.selected_guild_ids)
         guild_placeholder = f"Bước 1: Chọn Server (Trang {self.current_guild_page + 1}/{len(self.guild_pages)})"
         # *** THAY ĐỔI 3: Cho phép chọn nhiều server (min_values=0, max_values=...) ***
         guild_select = discord.ui.Select(
@@ -693,20 +874,19 @@ class DeployView(discord.ui.View):
         
         # *** THAY ĐỔI 4: Cập nhật callback để xử lý nhiều lựa chọn server ***
         async def guild_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.author.id: return
-            
             # Xóa các lựa chọn cũ từ trang này để không bị trùng lặp
-            ids_on_this_page = {int(opt.value) for opt in guild_options}
-            self.selected_guild_ids.difference_update(ids_on_this_page)
-            
-            # Thêm các lựa chọn mới
-            for gid in interaction.data["values"]:
-                self.selected_guild_ids.add(int(gid))
+            ids_on_this_page = {guild.id for guild in current_guilds}
+            submitted_ids = {int(gid) for gid in interaction.data.get("values", [])}
+            self.selected_guild_ids = replace_page_selection(
+                self.selected_guild_ids,
+                ids_on_this_page,
+                submitted_ids,
+            )
                 
             # Cập nhật lại view để hiển thị đúng các lựa chọn
             self.update_view()
-            await interaction.message.edit(view=self)
-            await interaction.response.send_message(f"✅ Cập nhật! Đã chọn **{len(self.selected_guild_ids)}** server.", ephemeral=True)
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send(f"✅ Cập nhật! Đã chọn **{len(self.selected_guild_ids)}** server.", ephemeral=True)
 
         guild_select.callback = guild_callback
         self.add_item(guild_select)
@@ -717,13 +897,11 @@ class DeployView(discord.ui.View):
             next_guild_button = discord.ui.Button(label="Server Tiếp ▶️", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_guild_page >= len(self.guild_pages) - 1))
 
             async def prev_guild_callback(interaction: discord.Interaction):
-                if interaction.user.id != self.author.id: return
                 self.current_guild_page -= 1
                 self.update_view()
                 await interaction.response.edit_message(view=self)
             
             async def next_guild_callback(interaction: discord.Interaction):
-                if interaction.user.id != self.author.id: return
                 self.current_guild_page += 1
                 self.update_view()
                 await interaction.response.edit_message(view=self)
@@ -736,7 +914,7 @@ class DeployView(discord.ui.View):
         # --- Tạo menu chọn Điệp viên ---
         agent_options = [
             discord.SelectOption(
-                label=str(agent.get('username', agent.get('id'))), 
+                label=str(agent.get('username', agent.get('id')))[:100],
                 value=str(agent.get('id')),
                 default=(int(agent.get('id')) in self.selected_user_ids)
             ) for agent in self.agent_pages[self.current_agent_page]
@@ -745,16 +923,16 @@ class DeployView(discord.ui.View):
         agent_select = discord.ui.Select(placeholder=agent_placeholder, min_values=0, max_values=len(agent_options), options=agent_options, row=2)
 
         async def agent_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.author.id: return
-            
             ids_on_this_page = {int(opt.value) for opt in agent_options}
-            self.selected_user_ids.difference_update(ids_on_this_page)
-            
-            for uid in interaction.data["values"]:
-                self.selected_user_ids.add(int(uid))
+            submitted_ids = {int(uid) for uid in interaction.data.get("values", [])}
+            self.selected_user_ids = replace_page_selection(
+                self.selected_user_ids,
+                ids_on_this_page,
+                submitted_ids,
+            )
                 
             self.update_view()
-            await interaction.message.edit(view=self)
+            await interaction.response.edit_message(view=self)
             await interaction.followup.send(f"✅ Cập nhật! Đã chọn **{len(self.selected_user_ids)}** điệp viên.", ephemeral=True)
             
         agent_select.callback = agent_callback
@@ -766,13 +944,11 @@ class DeployView(discord.ui.View):
             next_agent_button = discord.ui.Button(label="Điệp viên Tiếp ▶️", style=discord.ButtonStyle.secondary, row=3, disabled=(self.current_agent_page >= len(self.agent_pages) - 1))
 
             async def prev_agent_callback(interaction: discord.Interaction):
-                if interaction.user.id != self.author.id: return
                 self.current_agent_page -= 1
                 self.update_view()
                 await interaction.response.edit_message(view=self)
 
             async def next_agent_callback(interaction: discord.Interaction):
-                if interaction.user.id != self.author.id: return
                 self.current_agent_page += 1
                 self.update_view()
                 await interaction.response.edit_message(view=self)
@@ -795,10 +971,9 @@ class DeployView(discord.ui.View):
         
         # *** THAY ĐỔI 6: Cập nhật logic xử lý triển khai cho nhiều server ***
         async def deploy_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.author.id: return
-            
             # Vô hiệu hóa view
-            for item in self.children: item.disabled = True
+            for item in self.children:
+                item.disabled = True
             await interaction.response.edit_message(view=self)
             
             await interaction.followup.send(
@@ -835,7 +1010,7 @@ class DeployView(discord.ui.View):
                         fail_count += 1
                         failed_adds.append(f"<@{user_id}> -> `{guild.name}` (Lỗi: {e})")
             
-            embed = discord.Embed(title=f"Báo Cáo Triển Khai Hàng Loạt", color=0x00ff00)
+            embed = discord.Embed(title="Báo Cáo Triển Khai Hàng Loạt", color=0x00ff00)
             embed.add_field(name="✅ Lượt Thêm Thành Công", value=f"{success_count}", inline=True)
             embed.add_field(name="❌ Lượt Thêm Thất Bại", value=f"{fail_count}", inline=True)
             
@@ -851,15 +1026,14 @@ class DeployView(discord.ui.View):
         deploy_button.callback = deploy_callback
         self.add_item(deploy_button)
 
-class KickView(discord.ui.View):
+class KickView(AuthorOnlyView):
     def __init__(self, author: discord.User, guilds: list[discord.Guild], agents: list[dict]):
-        super().__init__(timeout=600)
-        self.author = author
+        super().__init__(author, timeout=600)
         self.all_guilds = guilds
         
         # Chia dữ liệu thành các trang
-        self.guild_pages = [guilds[i:i + 25] for i in range(0, len(guilds), 25)]
-        self.agent_pages = [agents[i:i + 25] for i in range(0, len(agents), 25)]
+        self.guild_pages = paginate_items(guilds, SERVER_PAGE_SIZE)
+        self.agent_pages = paginate_items(agents, AGENT_PAGE_SIZE)
         
         # Theo dõi trang và lựa chọn hiện tại
         self.current_guild_page = 0
@@ -873,22 +1047,29 @@ class KickView(discord.ui.View):
         """Xóa và dựng lại giao diện dựa trên trạng thái hiện tại."""
         self.clear_items()
 
+        if not self.guild_pages or not self.agent_pages:
+            self.add_item(discord.ui.Button(
+                label="Không có đủ dữ liệu server/agent",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+            ))
+            return
+
         # --- Menu Chọn Server ---
-        guild_options = [
-            discord.SelectOption(
-                label=g.name, value=str(g.id), default=(g.id in self.selected_guild_ids)
-            ) for g in self.guild_pages[self.current_guild_page]
-        ]
+        current_guilds = self.guild_pages[self.current_guild_page]
+        guild_options = build_guild_options(current_guilds, self.selected_guild_ids)
         guild_placeholder = f"Bước 1: Chọn Server (Trang {self.current_guild_page + 1}/{len(self.guild_pages)})"
         guild_select = discord.ui.Select(
             placeholder=guild_placeholder, min_values=0, max_values=len(guild_options), options=guild_options, row=0
         )
         async def guild_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.author.id: return
-            ids_on_this_page = {int(opt.value) for opt in guild_options}
-            self.selected_guild_ids.difference_update(ids_on_this_page)
-            for gid in interaction.data["values"]:
-                self.selected_guild_ids.add(int(gid))
+            ids_on_this_page = {guild.id for guild in current_guilds}
+            submitted_ids = {int(gid) for gid in interaction.data.get("values", [])}
+            self.selected_guild_ids = replace_page_selection(
+                self.selected_guild_ids,
+                ids_on_this_page,
+                submitted_ids,
+            )
             self.update_view()
             await interaction.response.edit_message(view=self)
             await interaction.followup.send(f"✅ Đã cập nhật! Hiện đã chọn **{len(self.selected_guild_ids)}** server.", ephemeral=True)
@@ -904,7 +1085,6 @@ class KickView(discord.ui.View):
             row=1
         )
         async def select_all_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.author.id: return
             if all_selected:
                 self.selected_guild_ids.clear()
             else:
@@ -919,12 +1099,12 @@ class KickView(discord.ui.View):
             prev_guild_button = discord.ui.Button(label="◀️ Trước", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_guild_page == 0))
             next_guild_button = discord.ui.Button(label="Sau ▶️", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_guild_page >= len(self.guild_pages) - 1))
             async def prev_guild_callback(interaction: discord.Interaction):
-                if interaction.user.id != self.author.id: return
-                self.current_guild_page -= 1; self.update_view()
+                self.current_guild_page -= 1
+                self.update_view()
                 await interaction.response.edit_message(view=self)
             async def next_guild_callback(interaction: discord.Interaction):
-                if interaction.user.id != self.author.id: return
-                self.current_guild_page += 1; self.update_view()
+                self.current_guild_page += 1
+                self.update_view()
                 await interaction.response.edit_message(view=self)
             prev_guild_button.callback = prev_guild_callback
             next_guild_button.callback = next_guild_callback
@@ -934,19 +1114,21 @@ class KickView(discord.ui.View):
         # --- Menu Chọn Agent ---
         agent_options = [
             discord.SelectOption(
-                label=str(agent.get('username', agent.get('id'))), value=str(agent.get('id')), default=(int(agent.get('id')) in self.selected_user_ids)
+                label=str(agent.get('username', agent.get('id')))[:100], value=str(agent.get('id')), default=(int(agent.get('id')) in self.selected_user_ids)
             ) for agent in self.agent_pages[self.current_agent_page]
         ]
         agent_placeholder = f"Bước 2: Chọn Agent để Kick (Trang {self.current_agent_page + 1}/{len(self.agent_pages)})"
         agent_select = discord.ui.Select(placeholder=agent_placeholder, min_values=0, max_values=len(agent_options), options=agent_options, row=2)
         async def agent_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.author.id: return
             ids_on_this_page = {int(opt.value) for opt in agent_options}
-            self.selected_user_ids.difference_update(ids_on_this_page)
-            for uid in interaction.data["values"]:
-                self.selected_user_ids.add(int(uid))
+            submitted_ids = {int(uid) for uid in interaction.data.get("values", [])}
+            self.selected_user_ids = replace_page_selection(
+                self.selected_user_ids,
+                ids_on_this_page,
+                submitted_ids,
+            )
             self.update_view()
-            await interaction.message.edit(view=self)
+            await interaction.response.edit_message(view=self)
             await interaction.followup.send(f"✅ Đã cập nhật! Hiện đã chọn **{len(self.selected_user_ids)}** agent.", ephemeral=True)
         agent_select.callback = agent_callback
         self.add_item(agent_select)
@@ -956,12 +1138,12 @@ class KickView(discord.ui.View):
             prev_agent_button = discord.ui.Button(label="◀️ Trước", style=discord.ButtonStyle.secondary, row=3, disabled=(self.current_agent_page == 0))
             next_agent_button = discord.ui.Button(label="Sau ▶️", style=discord.ButtonStyle.secondary, row=3, disabled=(self.current_agent_page >= len(self.agent_pages) - 1))
             async def prev_agent_callback(interaction: discord.Interaction):
-                if interaction.user.id != self.author.id: return
-                self.current_agent_page -= 1; self.update_view()
+                self.current_agent_page -= 1
+                self.update_view()
                 await interaction.response.edit_message(view=self)
             async def next_agent_callback(interaction: discord.Interaction):
-                if interaction.user.id != self.author.id: return
-                self.current_agent_page += 1; self.update_view()
+                self.current_agent_page += 1
+                self.update_view()
                 await interaction.response.edit_message(view=self)
             prev_agent_button.callback = prev_agent_callback
             next_agent_button.callback = next_agent_callback
@@ -976,9 +1158,8 @@ class KickView(discord.ui.View):
         )
         
         async def kick_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.author.id: return
-            
-            for item in self.children: item.disabled = True
+            for item in self.children:
+                item.disabled = True
             await interaction.response.edit_message(view=self)
             
             await interaction.followup.send(
@@ -1027,127 +1208,6 @@ class KickView(discord.ui.View):
         kick_button.callback = kick_callback
         self.add_item(kick_button)
         
-# --- Modal 1: Nhập số lượng kênh ---
-# --- View để chọn số lượng kênh ---
-class QuantityView(discord.ui.View):
-    def __init__(self, selected_guilds: list[discord.Guild], author: discord.User):
-        super().__init__(timeout=300)
-        self.selected_guilds = selected_guilds
-        self.author = author
-
-    @discord.ui.button(label="1 Kênh", style=discord.ButtonStyle.secondary)
-    async def one_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.author.id:
-            return await interaction.response.send_message("❌ Chỉ người tạo lệnh mới có thể sử dụng!", ephemeral=True)
-        await interaction.response.send_modal(NamesModal(self.selected_guilds, 1))
-
-    @discord.ui.button(label="2 Kênh", style=discord.ButtonStyle.secondary)
-    async def two_channels(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.author.id:
-            return await interaction.response.send_message("❌ Chỉ người tạo lệnh mới có thể sử dụng!", ephemeral=True)
-        await interaction.response.send_modal(NamesModal(self.selected_guilds, 2))
-
-    @discord.ui.button(label="3 Kênh", style=discord.ButtonStyle.secondary)
-    async def three_channels(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.author.id:
-            return await interaction.response.send_message("❌ Chỉ người tạo lệnh mới có thể sử dụng!", ephemeral=True)
-        await interaction.response.send_modal(NamesModal(self.selected_guilds, 3))
-
-    @discord.ui.button(label="4 Kênh", style=discord.ButtonStyle.secondary)
-    async def four_channels(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.author.id:
-            return await interaction.response.send_message("❌ Chỉ người tạo lệnh mới có thể sử dụng!", ephemeral=True)
-        await interaction.response.send_modal(NamesModal(self.selected_guilds, 4))
-
-    @discord.ui.button(label="5 Kênh", style=discord.ButtonStyle.secondary)
-    async def five_channels(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.author.id:
-            return await interaction.response.send_message("❌ Chỉ người tạo lệnh mới có thể sử dụng!", ephemeral=True)
-        await interaction.response.send_modal(NamesModal(self.selected_guilds, 5))
-
-# --- Modal để nhập tên riêng cho từng kênh ---
-class NamesModal(discord.ui.Modal):
-    def __init__(self, selected_guilds: list[discord.Guild], quantity: int):
-        super().__init__(title=f"Nhập Tên Cho {quantity} Kênh")
-        self.selected_guilds = selected_guilds
-        self.quantity = quantity
-        
-        # Tạo các TextInput fields dựa trên số lượng
-        if quantity >= 1:
-            self.name1 = discord.ui.TextInput(
-                label="Tên Kênh #1",
-                placeholder="Nhập tên cho kênh thứ 1...",
-                required=True
-            )
-            self.add_item(self.name1)
-        
-        if quantity >= 2:
-            self.name2 = discord.ui.TextInput(
-                label="Tên Kênh #2", 
-                placeholder="Nhập tên cho kênh thứ 2...",
-                required=True
-            )
-            self.add_item(self.name2)
-            
-        if quantity >= 3:
-            self.name3 = discord.ui.TextInput(
-                label="Tên Kênh #3",
-                placeholder="Nhập tên cho kênh thứ 3...", 
-                required=True
-            )
-            self.add_item(self.name3)
-            
-        if quantity >= 4:
-            self.name4 = discord.ui.TextInput(
-                label="Tên Kênh #4",
-                placeholder="Nhập tên cho kênh thứ 4...",
-                required=True
-            )
-            self.add_item(self.name4)
-            
-        if quantity >= 5:
-            self.name5 = discord.ui.TextInput(
-                label="Tên Kênh #5",
-                placeholder="Nhập tên cho kênh thứ 5...",
-                required=True
-            )
-            self.add_item(self.name5)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # Lấy tên từ các ô nhập liệu dựa trên số lượng
-        channel_names = []
-        
-        if hasattr(self, 'name1'):
-            channel_names.append(self.name1.value)
-        if hasattr(self, 'name2'):
-            channel_names.append(self.name2.value)
-        if hasattr(self, 'name3'):
-            channel_names.append(self.name3.value)
-        if hasattr(self, 'name4'):
-            channel_names.append(self.name4.value)
-        if hasattr(self, 'name5'):
-            channel_names.append(self.name5.value)
-        
-        await interaction.response.send_message(f"✅ **Đã nhận lệnh!** Chuẩn bị tạo **{len(channel_names)}** kênh trong **{len(self.selected_guilds)}** server...", ephemeral=True)
-
-        total_success = 0
-        total_fail = 0
-        
-        for guild in self.selected_guilds:
-            await asyncio.sleep(2)
-            for name in channel_names:
-                try:
-                    await guild.create_text_channel(name=name)
-                    total_success += 1
-                except discord.Forbidden:
-                    total_fail += 1
-                    print(f"Lỗi quyền: Không thể tạo kênh '{name}' trong server {guild.name}")
-                except Exception as e:
-                    total_fail += 1
-                    print(f"Lỗi không xác định khi tạo kênh '{name}': {e}")
-        
-        await interaction.followup.send(f"**Báo cáo hoàn tất:**\n✅ Đã tạo thành công: **{total_success}** kênh.\n❌ Thất bại: **{total_fail}** kênh.")
-
 # --- View để chọn số lượng kênh ---
 class QuantityView(discord.ui.View):
     def __init__(self, selected_guilds: list[discord.Guild], author: discord.User):
@@ -1268,14 +1328,12 @@ class NamesModal(discord.ui.Modal):
         await interaction.followup.send(f"**Báo cáo hoàn tất:**\n✅ Đã tạo thành công: **{total_success}** kênh.\n❌ Thất bại: **{total_fail}** kênh.")
 
 # --- View để chọn server và bắt đầu quy trình (PHIÊN BẢN NÂNG CẤP) ---
-class CreateChannelView(discord.ui.View):
+class CreateChannelView(AuthorOnlyView):
     def __init__(self, author: discord.User, guilds: list[discord.Guild]):
-        super().__init__(timeout=600)
-        self.author = author
+        super().__init__(author, timeout=600)
         self.all_guilds = guilds
         
-        # Chia danh sách server thành các trang, mỗi trang 25 server
-        self.guild_pages = [self.all_guilds[i:i + 25] for i in range(0, len(self.all_guilds), 25)]
+        self.guild_pages = paginate_items(self.all_guilds, SERVER_PAGE_SIZE)
         
         # Theo dõi trạng thái
         self.current_guild_page = 0
@@ -1288,16 +1346,17 @@ class CreateChannelView(discord.ui.View):
         """Xóa và dựng lại toàn bộ giao diện dựa trên trạng thái hiện tại."""
         self.clear_items()
 
+        if not self.guild_pages:
+            self.add_item(discord.ui.Button(
+                label="Không có server khả dụng",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+            ))
+            return
+
         # --- Menu Chọn Server ---
-        current_options = [
-            discord.SelectOption(
-                label=g.name, 
-                value=str(g.id),
-                # Đánh dấu những server đã được chọn trước đó
-                default=(g.id in self.selected_guild_ids)
-            ) 
-            for g in self.guild_pages[self.current_guild_page]
-        ]
+        current_guilds = self.guild_pages[self.current_guild_page]
+        current_options = build_guild_options(current_guilds, self.selected_guild_ids)
         
         placeholder = f"Bước 1: Chọn Server (Trang {self.current_guild_page + 1}/{len(self.guild_pages)})"
         
@@ -1315,12 +1374,13 @@ class CreateChannelView(discord.ui.View):
                 return await interaction.response.send_message("❌ Bạn không có quyền tương tác!", ephemeral=True)
             
             # Xóa các lựa chọn cũ từ trang này để xử lý việc bỏ chọn
-            ids_on_this_page = {int(opt.value) for opt in current_options}
-            self.selected_guild_ids.difference_update(ids_on_this_page)
-            
-            # Thêm các lựa chọn mới từ tương tác
-            for gid in interaction.data["values"]:
-                self.selected_guild_ids.add(int(gid))
+            ids_on_this_page = {guild.id for guild in current_guilds}
+            submitted_ids = {int(gid) for gid in interaction.data.get("values", [])}
+            self.selected_guild_ids = replace_page_selection(
+                self.selected_guild_ids,
+                ids_on_this_page,
+                submitted_ids,
+            )
                 
             # Cập nhật lại giao diện để hiển thị đúng các lựa chọn và trạng thái nút
             self.update_view()
@@ -1336,13 +1396,11 @@ class CreateChannelView(discord.ui.View):
             next_button = discord.ui.Button(label="Trang Tiếp ▶️", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_guild_page >= len(self.guild_pages) - 1))
 
             async def prev_callback(interaction: discord.Interaction):
-                if interaction.user.id != self.author.id: return
                 self.current_guild_page -= 1
                 self.update_view()
                 await interaction.response.edit_message(view=self)
             
             async def next_callback(interaction: discord.Interaction):
-                if interaction.user.id != self.author.id: return
                 self.current_guild_page += 1
                 self.update_view()
                 await interaction.response.edit_message(view=self)
@@ -1370,7 +1428,7 @@ class CreateChannelView(discord.ui.View):
             # Vô hiệu hóa giao diện cũ trước khi gửi cái mới
             for item in self.children:
                 item.disabled = True
-            await interaction.message.edit(view=self)
+            await interaction.response.edit_message(view=self)
 
             # Lấy các đối tượng guild từ các ID đã chọn
             selected_guilds = [g for g in self.all_guilds if g.id in self.selected_guild_ids]
@@ -1383,7 +1441,7 @@ class CreateChannelView(discord.ui.View):
             
             # Gửi tin nhắn mới (ephemeral) với các nút chọn số lượng
             view = QuantityView(selected_guilds, self.author)
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
         proceed_button.callback = proceed_callback
         self.add_item(proceed_button)
@@ -1393,8 +1451,9 @@ class CreateChannelView(discord.ui.View):
 @commands.is_owner()
 async def create(ctx):
     """Mở giao diện tạo kênh hàng loạt."""
-    # Sắp xếp server giống như lệnh deploy để có thứ tự nhất quán
-    sorted_guilds = sorted(bot.guilds, key=lambda g: g.me.joined_at)
+    sorted_guilds = await get_ordered_guilds()
+    if not sorted_guilds:
+        return await ctx.send("❌ Bot chưa tham gia server nào để tạo kênh.")
     
     view = CreateChannelView(ctx.author, sorted_guilds)
     
@@ -1451,14 +1510,12 @@ class ChannelNameModal(discord.ui.Modal, title="Nhập Tên Kênh Cần Tìm"):
         await interaction.followup.send(embed=embed)
         
 # --- View để lấy ID kênh (PHIÊN BẢN NÂNG CẤP VỚI PHÂN TRANG) ---
-class GetIdPaginatedView(discord.ui.View):
+class GetIdPaginatedView(AuthorOnlyView):
     def __init__(self, author: discord.User, guilds: list[discord.Guild]):
-        super().__init__(timeout=600)
-        self.author = author
+        super().__init__(author, timeout=600)
         self.all_guilds = guilds
         
-        # Chia danh sách server thành các trang, mỗi trang 25 server
-        self.guild_pages = [self.all_guilds[i:i + 25] for i in range(0, len(self.all_guilds), 25)]
+        self.guild_pages = paginate_items(self.all_guilds, SERVER_PAGE_SIZE)
         
         # Theo dõi trạng thái
         self.current_page = 0
@@ -1471,15 +1528,17 @@ class GetIdPaginatedView(discord.ui.View):
         """Xóa và dựng lại toàn bộ giao diện dựa trên trạng thái hiện tại."""
         self.clear_items()
 
+        if not self.guild_pages:
+            self.add_item(discord.ui.Button(
+                label="Không có server khả dụng",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+            ))
+            return
+
         # --- Menu Chọn Server ---
-        current_options = [
-            discord.SelectOption(
-                label=g.name, 
-                value=str(g.id),
-                default=(g.id in self.selected_guild_ids) # Đánh dấu server đã chọn
-            ) 
-            for g in self.guild_pages[self.current_page]
-        ]
+        current_guilds = self.guild_pages[self.current_page]
+        current_options = build_guild_options(current_guilds, self.selected_guild_ids)
         
         placeholder = f"Bước 1: Chọn Server (Trang {self.current_page + 1}/{len(self.guild_pages)})"
         
@@ -1492,15 +1551,14 @@ class GetIdPaginatedView(discord.ui.View):
         )
         
         async def guild_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.author.id: return
-            
             # Xóa các lựa chọn cũ từ trang này để xử lý việc bỏ chọn
-            ids_on_this_page = {int(opt.value) for opt in current_options}
-            self.selected_guild_ids.difference_update(ids_on_this_page)
-            
-            # Thêm các lựa chọn mới
-            for gid in interaction.data["values"]:
-                self.selected_guild_ids.add(int(gid))
+            ids_on_this_page = {guild.id for guild in current_guilds}
+            submitted_ids = {int(gid) for gid in interaction.data.get("values", [])}
+            self.selected_guild_ids = replace_page_selection(
+                self.selected_guild_ids,
+                ids_on_this_page,
+                submitted_ids,
+            )
                 
             # Cập nhật lại giao diện
             self.update_view()
@@ -1516,13 +1574,11 @@ class GetIdPaginatedView(discord.ui.View):
             next_button = discord.ui.Button(label="Trang Tiếp ▶️", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page >= len(self.guild_pages) - 1))
 
             async def prev_callback(interaction: discord.Interaction):
-                if interaction.user.id != self.author.id: return
                 self.current_page -= 1
                 self.update_view()
                 await interaction.response.edit_message(view=self)
             
             async def next_callback(interaction: discord.Interaction):
-                if interaction.user.id != self.author.id: return
                 self.current_page += 1
                 self.update_view()
                 await interaction.response.edit_message(view=self)
@@ -1543,8 +1599,6 @@ class GetIdPaginatedView(discord.ui.View):
         )
         
         async def proceed_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.author.id: return
-            
             # Lấy các đối tượng guild từ các ID đã chọn
             selected_guilds = [g for g in self.all_guilds if g.id in self.selected_guild_ids]
             
@@ -1567,6 +1621,8 @@ async def on_ready():
     jsonbin_status = "Connected" if JSONBIN_API_KEY else "Not configured"
     print(f'💾 Database: {db_status}')
     print(f'🌐 JSONBin.io: {jsonbin_status}')
+
+    await get_ordered_guilds(force_refresh=True)
     
     
     #try:
@@ -1604,11 +1660,15 @@ async def auth(ctx):
     )
     embed = discord.Embed(
         title="🔐 Ủy quyền cho Bot",
-        description=f"Nhấp vào link bên dưới để cho phép bot thêm bạn vào các server:",
+        description="Nhấp vào link bên dưới để cho phép bot thêm bạn vào các server:",
         color=0x00ff00
     )
     embed.add_field(name="🔗 Link ủy quyền", value=f"[Nhấp vào đây]({auth_url})", inline=False)
-    embed.add_field(name="📌 Lưu ý", value="Token sẽ được lưu an toàn vào cloud storage", inline=False)
+    embed.add_field(
+        name="📌 Lưu ý",
+        value="Bot lưu access token OAuth vào các backend đã cấu hình; bot không lưu mật khẩu Discord.",
+        inline=False,
+    )
     await ctx.send(embed=embed)
 
 @bot.command(name='add_me', help='Thêm bạn vào tất cả các server của bot.')
@@ -1667,7 +1727,7 @@ async def check_token(ctx):
             description="Bot đã có token của bạn và có thể thêm bạn vào server",
             color=0x00ff00
         )
-        embed.add_field(name="💾 Lưu trữ", value="Token được lưu an toàn trên cloud", inline=False)
+        embed.add_field(name="💾 Lưu trữ", value="Đã tìm thấy access token trong một backend lưu trữ đã cấu hình.", inline=False)
     else:
         embed = discord.Embed(
             title="❌ Chưa ủy quyền", 
@@ -1751,10 +1811,10 @@ async def force_add_error(ctx, error):
     if isinstance(error, commands.NotOwner):
         await ctx.send("🚫 Lỗi: Bạn không có quyền sử dụng lệnh này!")
     elif isinstance(error, commands.UserNotFound):
-        await ctx.send(f"❌ Lỗi: Không tìm thấy người dùng được chỉ định.")
+        await ctx.send("❌ Lỗi: Không tìm thấy người dùng được chỉ định.")
     else:
         print(f"Lỗi khi thực thi lệnh force_add: {error}")
-        await ctx.send(f"Đã có lỗi xảy ra khi thực thi lệnh. Vui lòng kiểm tra console.")
+        await ctx.send("Đã có lỗi xảy ra khi thực thi lệnh. Vui lòng kiểm tra console.")
         
 @bot.command(name='invite', help='(Chủ bot) Mở giao diện để chọn server mời người dùng vào.')
 @commands.is_owner()
@@ -1766,8 +1826,11 @@ async def invite(ctx, user_to_add: discord.User):
         await ctx.send("Không tìm thấy người dùng này.")
         return
         
-    # Tạo giao diện (View) và truyền các thông tin cần thiết
-    view = ServerSelectView(author=ctx.author, target_user=user_to_add, guilds=bot.guilds)
+    guilds = await get_ordered_guilds()
+    if not guilds:
+        return await ctx.send("❌ Bot chưa tham gia server nào để thực hiện lời mời.")
+
+    view = ServerSelectView(author=ctx.author, target_user=user_to_add, guilds=guilds)
     
     embed = discord.Embed(
         title=f"💌 Mời {user_to_add.name}",
@@ -1778,66 +1841,113 @@ async def invite(ctx, user_to_add: discord.User):
     
     await ctx.send(embed=embed, view=view)
 
-# --- SLASH COMMANDS ---
-@bot.tree.command(name="help", description="Hiển thị thông tin về các lệnh của bot")
+# --- SHARED HELP UI + SLASH COMMANDS ---
+def build_help_embed(category, is_owner):
+    """Build one help category from the single shared command data source."""
+    if category == 'owner' and not is_owner:
+        category = 'overview'
+
+    title, emoji = HELP_CATEGORY_META[category]
+    embed = discord.Embed(title=f"{emoji} {title}", color=0x0099ff)
+
+    if category == 'overview':
+        embed.description = (
+            "Chọn một nhóm trong menu để xem **cú pháp, quyền, tác dụng, tham số, "
+            "ví dụ và cảnh báo** của từng lệnh.\n\n"
+            f"• Menu server hiển thị tối đa **{SERVER_PAGE_SIZE} server/trang**.\n"
+            "• Các thao tác thêm thành viên cần người dùng hoàn tất `!auth`.\n"
+            "• Không gửi access token, mật khẩu hay mã OTP vào Discord."
+        )
+        embed.add_field(
+            name="🌐 Công khai",
+            value="`!ping`, `!auth`, `!add_me`, `!check_token`, `!status`, `!help` / `/help`",
+            inline=False,
+        )
+        embed.add_field(
+            name="🛡️ Quản lý Server",
+            value="`!invitebot` — yêu cầu quyền Manage Server.",
+            inline=False,
+        )
+        if is_owner:
+            embed.add_field(
+                name="👑 Owner",
+                value="Các lệnh quản trị dữ liệu và thao tác hàng loạt chỉ hiện với chủ bot.",
+                inline=False,
+            )
+    else:
+        commands_in_category = help_commands_for(category)
+        embed.description = f"Có **{len(commands_in_category)}** lệnh trong nhóm này."
+        for command in commands_in_category:
+            embed.add_field(
+                name=f"`{command['syntax']}`",
+                value=(
+                    f"**Quyền:** {command['permission']}\n"
+                    f"**Tác dụng:** {command['summary']}\n"
+                    f"**Chi tiết:** {command['details']}"
+                ),
+                inline=False,
+            )
+
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="Nội dung Help được tạo từ cùng một nguồn cho !help và /help.")
+    return embed
+
+
+class HelpView(AuthorOnlyView):
+    def __init__(self, author, is_owner):
+        super().__init__(author, timeout=300)
+        self.is_owner = is_owner
+
+        categories = ['overview', 'public', 'manage']
+        if is_owner:
+            categories.append('owner')
+        options = [
+            discord.SelectOption(
+                label=HELP_CATEGORY_META[category][0],
+                value=category,
+                emoji=HELP_CATEGORY_META[category][1],
+                default=(category == 'overview'),
+            )
+            for category in categories
+        ]
+        category_select = discord.ui.Select(
+            placeholder="Chọn nhóm lệnh cần xem",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+
+        async def category_callback(interaction: discord.Interaction):
+            category = interaction.data['values'][0]
+            for option in category_select.options:
+                option.default = option.value == category
+            await interaction.response.edit_message(
+                embed=build_help_embed(category, self.is_owner),
+                view=self,
+            )
+
+        category_select.callback = category_callback
+        self.add_item(category_select)
+
+
+@bot.tree.command(name="help", description="Hiển thị hướng dẫn chi tiết về các lệnh của bot")
 async def help_slash(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="📝 Bảng Lệnh Của Bot Mật Vụ",
-        description="Dưới đây là danh sách các mật lệnh có sẵn.",
-        color=0x0099ff
+    is_owner = await bot.is_owner(interaction.user)
+    await interaction.response.send_message(
+        embed=build_help_embed('overview', is_owner),
+        view=HelpView(interaction.user, is_owner),
+        ephemeral=True,
     )
-    embed.set_thumbnail(url=bot.user.display_avatar.url)
-    
-    # Lệnh cho mọi người
-    embed.add_field(name="🕵️ Lệnh Cơ Bản (Dành cho mọi Điệp viên)", value="----------------------------------", inline=False)
-    embed.add_field(name="`!auth`", value="Lấy link ủy quyền để gia nhập mạng lưới.", inline=True)
-    embed.add_field(name="`!add_me`", value="Tự triển khai bản thân đến tất cả server.", inline=True)
-    embed.add_field(name="`!check_token`", value="Kiểm tra trạng thái ủy quyền của bạn.", inline=True)
-    embed.add_field(name="`!status`", value="Xem trạng thái hoạt động của bot và hệ thống.", inline=True)
-    embed.add_field(name="`!ping`", value="Kiểm tra độ trễ của bot.", inline=True)
-    
-    # Lệnh chỉ dành cho chủ bot
-    if await bot.is_owner(interaction.user):
-        embed.add_field(name="👑 Lệnh Chỉ Huy (Chỉ dành cho Owner)", value="----------------------------------", inline=False)
-        embed.add_field(name="`!roster`", value="Xem danh sách điệp viên.", inline=True)
-        embed.add_field(name="`!deploy`", value="Thêm NHIỀU điệp viên vào MỘT server.", inline=True)
-        embed.add_field(name="`!invite <User>`", value="Thêm MỘT điệp viên vào NHIỀU server.", inline=True)
-        embed.add_field(name="`!remove <User>`", value="Xóa dữ liệu của một điệp viên.", inline=True)
-        embed.add_field(name="`!force_add <User>`", value="Ép thêm điệp viên vào TẤT CẢ server.", inline=True)
-        embed.add_field(name="`!storage_info`", value="Xem thông tin các hệ thống lưu trữ.", inline=True)
 
-    embed.set_footer(text="Hãy chọn một mật lệnh để bắt đầu chiến dịch.")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-    
-@bot.command(name='help', help='Hiển thị bảng trợ giúp về các lệnh.')
+
+@bot.command(name='help', help='Hiển thị hướng dẫn chi tiết về các lệnh.')
 async def help(ctx):
-    embed = discord.Embed(
-        title="📝 Bảng Lệnh Của Bot Mật Vụ",
-        description="Dưới đây là danh sách các mật lệnh có sẵn.",
-        color=0x0099ff
+    is_owner = await bot.is_owner(ctx.author)
+    await ctx.send(
+        embed=build_help_embed('overview', is_owner),
+        view=HelpView(ctx.author, is_owner),
     )
-    embed.set_thumbnail(url=bot.user.display_avatar.url)
-    
-    # Lệnh cho mọi người
-    embed.add_field(name="🕵️ Lệnh Cơ Bản (Dành cho mọi Điệp viên)", value="----------------------------------", inline=False)
-    embed.add_field(name="`!auth`", value="Lấy link ủy quyền để gia nhập mạng lưới.", inline=True)
-    embed.add_field(name="`!add_me`", value="Tự triển khai bản thân đến tất cả server.", inline=True)
-    embed.add_field(name="`!check_token`", value="Kiểm tra trạng thái ủy quyền của bạn.", inline=True)
-    embed.add_field(name="`!status`", value="Xem trạng thái hoạt động của bot và hệ thống.", inline=True)
-    embed.add_field(name="`!ping`", value="Kiểm tra độ trễ của bot.", inline=True)
-
-    # Lệnh chỉ dành cho chủ bot
-    if await bot.is_owner(ctx.author):
-        embed.add_field(name="👑 Lệnh Chỉ Huy (Chỉ dành cho Owner)", value="----------------------------------", inline=False)
-        embed.add_field(name="`!roster`", value="Xem danh sách điệp viên.", inline=True)
-        embed.add_field(name="`!deploy`", value="Thêm NHIỀU điệp viên vào MỘT server.", inline=True)
-        embed.add_field(name="`!invite <User>`", value="Thêm MỘT điệp viên vào NHIỀU server.", inline=True)
-        embed.add_field(name="`!remove <User>`", value="Xóa dữ liệu của một điệp viên.", inline=True)
-        embed.add_field(name="`!force_add <User>`", value="Ép thêm điệp viên vào TẤT CẢ server.", inline=True)
-        embed.add_field(name="`!storage_info`", value="Xem thông tin các hệ thống lưu trữ.", inline=True)
-
-    embed.set_footer(text="Hãy chọn một mật lệnh để bắt đầu chiến dịch.")
-    await ctx.send(embed=embed)
 
 # --- ADDITIONAL JSONBIN MANAGEMENT COMMANDS ---
 @bot.command(name='storage_info', help='(Chủ bot) Hiển thị thông tin về storage systems.')
@@ -1855,7 +1965,7 @@ async def storage_info(ctx):
             cursor.close()
             db_connection.close()
             db_info = f"✅ Connected ({db_count} tokens)"
-        except:
+        except Exception:
             db_info = "❌ Connection Error"
     else:
         db_info = "❌ Not Available"
@@ -1866,7 +1976,7 @@ async def storage_info(ctx):
             data = jsonbin_storage.read_data()
             jsonbin_count = len(data) if isinstance(data, dict) else 0
             jsonbin_info = f"✅ Connected ({jsonbin_count} tokens)"
-        except:
+        except Exception:
             jsonbin_info = "❌ Connection Error"
     else:
         jsonbin_info = "❌ Not Configured"
@@ -2134,11 +2244,11 @@ async def remove(ctx, user_to_remove: discord.User):
     
     await ctx.send(embed=embed)
 
-@bot.command(name='deploy', help='(Chủ bot) Thêm nhiều điệp viên vào một server.')
+@bot.command(name='deploy', help='(Chủ bot) Thêm nhiều điệp viên vào nhiều server đã chọn.')
 @commands.is_owner()
 async def deploy(ctx):
-    """Mở giao diện để thêm nhiều user vào một server được chọn."""
-    full_data = jsonbin_storage.read_data()
+    """Mở giao diện để thêm nhiều user vào nhiều server được chọn."""
+    full_data = await asyncio.to_thread(jsonbin_storage.read_data)
     
     # --- SỬA LỖI: Chỉ lấy các mục có key là số (ID người dùng) ---
     agent_data = {uid: data for uid, data in full_data.items() if uid.isdigit()}
@@ -2165,7 +2275,9 @@ async def deploy(ctx):
             for uid, data in agent_data.items()
         ]
 
-    guilds = sorted(bot.guilds, key=lambda g: g.me.joined_at)
+    guilds = await get_ordered_guilds()
+    if not guilds:
+        return await ctx.send("❌ Bot chưa tham gia server nào để triển khai.")
     
     view = DeployView(ctx.author, guilds, agents)
     
@@ -2182,8 +2294,9 @@ async def deploy(ctx):
 @commands.is_owner()
 async def getid(ctx):
     """Mở giao diện để tìm ID kênh."""
-    # Sắp xếp danh sách server theo ngày bot tham gia (từ cũ nhất -> mới nhất)
-    sorted_guilds = sorted(bot.guilds, key=lambda g: g.me.joined_at)
+    sorted_guilds = await get_ordered_guilds()
+    if not sorted_guilds:
+        return await ctx.send("❌ Bot chưa tham gia server nào để tìm kênh.")
     
     # Truyền danh sách đã sắp xếp vào View mới
     view = GetIdPaginatedView(ctx.author, sorted_guilds)
@@ -2261,7 +2374,7 @@ async def invite_bot_error(ctx, error):
 @commands.is_owner()
 async def kick(ctx):
     """Mở giao diện để kick nhiều user khỏi nhiều server được chọn."""
-    full_data = jsonbin_storage.read_data()
+    full_data = await asyncio.to_thread(jsonbin_storage.read_data)
     agent_data = {uid: data for uid, data in full_data.items() if uid.isdigit()}
 
     if not agent_data:
@@ -2272,7 +2385,9 @@ async def kick(ctx):
         for uid, data in agent_data.items()
     ]
     
-    guilds = sorted(bot.guilds, key=lambda g: g.me.joined_at)
+    guilds = await get_ordered_guilds()
+    if not guilds:
+        return await ctx.send("❌ Bot chưa tham gia server nào để thực hiện kick.")
     
     view = KickView(ctx.author, guilds, agents)
     
@@ -2861,6 +2976,10 @@ def index():
                     <span class="command-code">!status</span>
                     <span class="command-desc">- Báo cáo chẩn đoán hệ thống</span>
                 </div>
+                <div class="command-item">
+                    <span class="command-code">!help / /help</span>
+                    <span class="command-desc">- Xem cú pháp, quyền và cảnh báo chi tiết cho mọi lệnh</span>
+                </div>
                 <hr style="border: 1px solid var(--mysterious-green); margin: 15px 0; opacity: 0.5;">
                 <p style="text-align: center; color: var(--old-gold); font-family: 'Creepster', cursive; font-size: 1.1em;">
                     <strong>🕴️ LỆNH DÀNH RIÊNG CHO CHỈ HUY 🕴️</strong>
@@ -2876,12 +2995,12 @@ def index():
             </div>
             
             <div class="security-notice">
-                <h3 class="security-title">🔒 GIAO THỨC BẢO MẬT TUYỆT ĐỐI</h3>
+                <h3 class="security-title">🔒 THÔNG TIN BẢO MẬT</h3>
                 <ul class="security-list">
-                    <li>Mọi thông tin được mã hóa chuẩn quân sự</li>
+                    <li>OAuth chỉ yêu cầu các scope <code>identify</code> và <code>guilds.join</code></li>
                     <li>Không lưu trữ mật khẩu Discord trong kho lưu trữ</li>
                     <li>Quyền truy cập tối thiểu cho các hoạt động bí mật</li>
-                    <li>Lưu trữ đám mây an toàn với hệ thống dự phòng</li>
+                    <li>Access token được lưu trong các backend do quản trị viên cấu hình</li>
                 </ul>
             </div>
             
@@ -2912,7 +3031,7 @@ def callback():
     }
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
 
-    token_response = requests.post(token_url, data=payload, headers=headers)
+    token_response = requests.post(token_url, data=payload, headers=headers, timeout=15)
     if token_response.status_code != 200:
         return f"❌ Lỗi khi lấy token: {token_response.text}", 500
     
@@ -2921,7 +3040,7 @@ def callback():
 
     user_info_url = 'https://discord.com/api/v10/users/@me'
     headers = {'Authorization': f'Bearer {access_token}'}
-    user_response = requests.get(user_info_url, headers=headers)
+    user_response = requests.get(user_info_url, headers=headers, timeout=15)
     
     if user_response.status_code != 200:
         return "❌ Lỗi: Không thể lấy thông tin người dùng.", 500
@@ -2932,7 +3051,7 @@ def callback():
     avatar_hash = user_data.get('avatar')
     
     # Lưu token vào các storage systems
-    success = save_user_token(user_id, access_token, username, avatar_hash)
+    save_user_token(user_id, access_token, username, avatar_hash)
     
     # Determine storage info
     storage_methods = []
@@ -3316,12 +3435,12 @@ def callback():
             </div>
             
             <div class="security-assurance">
-                <h3 class="classified-header" style="color: var(--mysterious-green);">🛡️ GIAO THỨC BẢO MẬT KÍCH HOẠT</h3>
+                <h3 class="classified-header" style="color: var(--mysterious-green);">🛡️ THÔNG TIN ỦY QUYỀN</h3>
                 <ul class="security-list">
-                    <li>Thông tin được mã hóa với cấp độ lượng tử</li>
+                    <li>Đã nhận access token OAuth cho các scope đã yêu cầu</li>
                     <li>Không lưu giữ mật khẩu Discord trong hệ thống</li>
                     <li>Dấu chân truy cập tối thiểu cho hoạt động bí mật</li>
-                    <li>Hệ thống lưu trữ đám mây an toàn, đa dự phòng</li>
+                    <li>Token được ghi vào các backend lưu trữ đang cấu hình</li>
                 </ul>
             </div>
             
@@ -3344,14 +3463,9 @@ def health():
     if db_connection:
         db_connection.close()
     
-    # Test JSONBin connection
     jsonbin_status = False
     if JSONBIN_API_KEY and JSONBIN_BIN_ID:
-        try:
-            test_data = jsonbin_storage.read_data()
-            jsonbin_status = True
-        except:
-            jsonbin_status = False
+        jsonbin_status, _ = jsonbin_storage.read_data_with_status()
     
     return {
         "status": "ok", 
@@ -3389,126 +3503,408 @@ def admin_logout():
     session.pop('logged_in', None)
     return redirect(url_for('index'))
 
+def build_admin_agents(full_data):
+    """Build a safe roster without ever exposing stored access tokens."""
+    agent_data = {
+        uid: data for uid, data in full_data.items()
+        if isinstance(uid, str) and uid.isdigit()
+    }
+    requested_order = full_data.get('_roster_order', [])
+    requested_order = requested_order if isinstance(requested_order, list) else []
+    ordered_ids = []
+    seen = set()
+    for value in requested_order:
+        uid = str(value)
+        if uid in agent_data and uid not in seen:
+            ordered_ids.append(uid)
+            seen.add(uid)
+    ordered_ids.extend(uid for uid in agent_data if uid not in seen)
+
+    agents = []
+    for uid in ordered_ids:
+        record = agent_data[uid] if isinstance(agent_data[uid], dict) else {}
+        avatar_hash = record.get('avatar_hash')
+        agents.append({
+            'id': uid,
+            'username': record.get('username') or 'N/A',
+            'avatar': f"https://cdn.discordapp.com/avatars/{uid}/{avatar_hash}.png" if avatar_hash else "",
+        })
+    return agents
+
+
+def build_admin_servers(guilds, stored_order):
+    servers = []
+    for guild in reconcile_guild_order(guilds, stored_order):
+        icon = getattr(guild, 'icon', None)
+        servers.append({
+            'id': str(guild.id),
+            'name': str(guild.name),
+            'icon': str(icon.url) if icon and getattr(icon, 'url', None) else '',
+        })
+    return servers
+
+
 @app.route('/admin/dashboard')
 @login_required
 def admin_dashboard():
-    # Đọc dữ liệu từ JSONBin
-    full_data = jsonbin_storage.read_data()
-    agent_data = {uid: data for uid, data in full_data.items() if uid.isdigit()}
-    
-    # Xử lý thứ tự sắp xếp (Roster Order)
-    order = full_data.get('_roster_order', [])
-    agents = []
-    seen = set()
-    
-    # Thêm agents theo thứ tự đã lưu
-    for uid in order:
-        if uid in agent_data:
-            d = agent_data[uid]
-            agents.append({
-                'id': uid, 
-                'username': d.get('username', 'N/A'), 
-                'avatar': f"https://cdn.discordapp.com/avatars/{uid}/{d.get('avatar_hash')}.png" if d.get('avatar_hash') else ""
-            })
-            seen.add(uid)
-            
-    # Thêm các agents còn lại (chưa được sắp xếp)
-    for uid, d in agent_data.items():
-        if uid not in seen:
-            agents.append({
-                'id': uid, 
-                'username': d.get('username', 'N/A'), 
-                'avatar': f"https://cdn.discordapp.com/avatars/{uid}/{d.get('avatar_hash')}.png" if d.get('avatar_hash') else ""
-            })
-            
+    storage_available, full_data = jsonbin_storage.read_data_with_status()
+    if not storage_available:
+        full_data = {}
+
+    bot_ready = bot.is_ready()
+    current_guilds = list(bot.guilds) if bot_ready else []
+    if storage_available:
+        set_cached_server_order(full_data.get(SERVER_ORDER_KEY, []))
+        owner_ids = set_bot_owner_ids(full_data.get(OWNER_IDS_KEY))
+    else:
+        owner_ids = get_bot_owner_ids()
+    cached_order, _ = get_cached_server_order()
+
+    agents = build_admin_agents(full_data)
+    servers = build_admin_servers(current_guilds, cached_order)
+
     return render_template_string("""
     <!DOCTYPE html>
-    <html>
+    <html lang="vi">
     <head>
-        <title>Roster Command Center</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Interlink Command Center</title>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.14.0/Sortable.min.js"></script>
         <style>
-            body { background: #1a1a1a; color: #e0e0e0; font-family: sans-serif; padding: 20px; max-width: 800px; margin: 0 auto; }
-            .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #DAA520; padding-bottom: 10px; margin-bottom: 20px; }
-            .btn { padding: 8px 16px; border: none; cursor: pointer; color: white; text-decoration: none; font-weight: bold; }
-            .btn-save { background: #006400; }
-            .btn-del { background: #8B0000; font-size: 0.8em; }
-            .btn-logout { background: #555; }
-            .agent-card { 
-                background: #2c2c2c; border: 1px solid #444; margin-bottom: 8px; padding: 10px; 
-                display: flex; align-items: center; justify-content: space-between; cursor: move;
-            }
-            .agent-info { display: flex; align-items: center; gap: 15px; }
-            .avatar { width: 35px; height: 35px; border-radius: 50%; border: 1px solid #DAA520; }
+            :root { --gold:#DAA520; --panel:#242424; --card:#303030; --muted:#999; --green:#08752b; --red:#8B0000; }
+            * { box-sizing: border-box; }
+            body { background:#151515; color:#e8e8e8; font-family:Arial,sans-serif; padding:20px; max-width:1180px; margin:0 auto; }
+            .header { display:flex; gap:16px; justify-content:space-between; align-items:center; border-bottom:2px solid var(--gold); padding-bottom:14px; margin-bottom:18px; }
+            h1,h2 { color:var(--gold); margin:0; }
+            .summary { color:var(--muted); margin:8px 0 0; }
+            .dashboard-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; }
+            .panel { background:var(--panel); border:1px solid #444; border-radius:10px; padding:16px; min-width:0; }
+            .panel-header { display:flex; gap:12px; justify-content:space-between; align-items:flex-start; margin-bottom:14px; }
+            .item-card { background:var(--card); border:1px solid #484848; border-radius:7px; margin-bottom:8px; padding:10px; display:flex; align-items:center; justify-content:space-between; gap:10px; cursor:grab; }
+            .item-card:active { cursor:grabbing; }
+            .item-info { display:flex; align-items:center; gap:12px; min-width:0; }
+            .item-text { min-width:0; }
+            .item-name { color:var(--gold); font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+            .item-id { color:var(--muted); font-size:.8rem; overflow-wrap:anywhere; }
+            .avatar { width:38px; height:38px; border-radius:50%; border:1px solid var(--gold); object-fit:cover; flex:0 0 auto; }
+            .handle { color:#888; font-size:1.2rem; }
+            .btn { padding:9px 14px; border:0; border-radius:5px; cursor:pointer; color:#fff; text-decoration:none; font-weight:bold; white-space:nowrap; }
+            .btn:disabled { opacity:.45; cursor:not-allowed; }
+            .btn-save { background:var(--green); }
+            .btn-del { background:var(--red); font-size:.8rem; }
+            .btn-logout { background:#555; }
+            .status { min-height:1.3em; margin:10px 0 0; color:var(--muted); font-size:.9rem; }
+            .status.ok { color:#66d987; } .status.error { color:#ff7777; }
+            .empty { color:var(--muted); text-align:center; padding:24px 8px; border:1px dashed #555; border-radius:7px; }
+            .owner-panel { grid-column:1 / -1; }
+            .owner-form { display:flex; gap:8px; margin-bottom:12px; }
+            .owner-input { min-width:0; flex:1; border:1px solid #555; border-radius:5px; background:#181818; color:#fff; padding:10px 12px; font:inherit; }
+            .owner-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:8px; }
+            .owner-card { margin:0; cursor:default; }
+            @media (max-width:800px) { .dashboard-grid { grid-template-columns:1fr; } .header { align-items:flex-start; } }
+            @media (max-width:520px) { body { padding:12px; } .header,.panel-header,.owner-form { flex-direction:column; } .header > .btn,.panel-header > .btn,.owner-form > .btn { width:100%; text-align:center; } }
         </style>
     </head>
     <body>
         <div class="header">
-            <h2 style="color:#DAA520;margin:0;">🕵️ ROSTER COMMAND</h2>
             <div>
-                <button onclick="saveOrder()" class="btn btn-save">💾 LƯU THỨ TỰ</button>
-                <a href="/admin/logout" class="btn btn-logout">Thoát</a>
+                <h1>🕵️ INTERLINK COMMAND CENTER</h1>
+                <p class="summary">Bot: {{ 'đã sẵn sàng' if bot_ready else 'chưa sẵn sàng' }} · JSONBin: {{ 'đã kết nối' if storage_available else 'không khả dụng' }}</p>
             </div>
+            <a href="/admin/logout" class="btn btn-logout">Thoát</a>
         </div>
-        <div id="roster-list">
-            {% for agent in agents %}
-            <div class="agent-card" data-id="{{ agent.id }}">
-                <div class="agent-info">
-                    <span style="color:#888;">☰</span>
-                    <img src="{{ agent.avatar }}" class="avatar" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">
-                    <div>
-                        <div style="font-weight:bold;color:#DAA520;">{{ agent.username }}</div>
-                        <div style="font-size:0.8em;color:#888;">{{ agent.id }}</div>
-                    </div>
-                </div>
-                <button onclick="deleteAgent('{{ agent.id }}')" class="btn btn-del">🗑️ XÓA</button>
-            </div>
-            {% endfor %}
-        </div>
-        <script>
-            new Sortable(document.getElementById('roster-list'), { animation: 150 });
 
-            async function saveOrder() {
-                const order = Array.from(document.querySelectorAll('.agent-card')).map(e => e.getAttribute('data-id'));
-                const res = await fetch('/admin/api/reorder', {
-                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({order: order})
-                });
-                alert((await res.json()).success ? '✅ Đã lưu!' : '❌ Lỗi!');
+        <div class="dashboard-grid">
+            <section class="panel" id="agent-panel">
+                <div class="panel-header">
+                    <div><h2>👤 Account / Agent</h2><p class="summary">Kéo để đổi thứ tự roster.</p></div>
+                    <button id="save-agent-order" onclick="saveAgentOrder()" class="btn btn-save" {{ 'disabled' if not storage_available else '' }}>💾 Lưu account</button>
+                </div>
+                <div id="roster-list">
+                    {% for agent in agents %}
+                    <div class="item-card agent-card" data-id="{{ agent.id }}">
+                        <div class="item-info">
+                            <span class="handle">☰</span>
+                            <img src="{{ agent.avatar }}" class="avatar" alt="" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">
+                            <div class="item-text"><div class="item-name">{{ agent.username }}</div><div class="item-id">{{ agent.id }}</div></div>
+                        </div>
+                        <button onclick="deleteAgent('{{ agent.id }}')" class="btn btn-del">🗑️ Xóa</button>
+                    </div>
+                    {% else %}<div class="empty">Không có dữ liệu account từ JSONBin.</div>{% endfor %}
+                </div>
+                <p id="agent-status" class="status {{ 'error' if not storage_available else '' }}" role="status">{{ 'JSONBin không khả dụng; chưa thể lưu thứ tự account.' if not storage_available else '' }}</p>
+            </section>
+
+            <section class="panel" id="server-panel">
+                <div class="panel-header">
+                    <div><h2>🖥️ Discord Server</h2><p class="summary">Thứ tự này được dùng trong menu chọn server của bot.</p></div>
+                    <button id="save-server-order" onclick="saveServerOrder()" class="btn btn-save" {{ 'disabled' if not bot_ready or not storage_available else '' }}>💾 Lưu server</button>
+                </div>
+                <div id="server-list">
+                    {% for server in servers %}
+                    <div class="item-card server-card" data-id="{{ server.id }}">
+                        <div class="item-info">
+                            <span class="handle">☰</span>
+                            <img src="{{ server.icon }}" class="avatar" alt="" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">
+                            <div class="item-text"><div class="item-name">{{ server.name }}</div><div class="item-id">{{ server.id }}</div></div>
+                        </div>
+                    </div>
+                    {% else %}<div class="empty">Bot chưa sẵn sàng hoặc chưa tham gia server nào.</div>{% endfor %}
+                </div>
+                <p id="server-status" class="status {{ 'error' if not bot_ready or not storage_available else '' }}" role="status">{% if not bot_ready %}Bot chưa sẵn sàng; chưa thể lưu thứ tự server.{% elif not storage_available %}JSONBin không khả dụng; chưa thể lưu thứ tự server.{% endif %}</p>
+            </section>
+
+            <section class="panel owner-panel" id="owner-panel">
+                <div class="panel-header">
+                    <div><h2>👑 Bot Owner ID</h2><p class="summary">Nhiều Discord user ID có thể cùng sử dụng các lệnh Owner.</p></div>
+                    <button id="save-owner-ids" onclick="saveOwnerIds()" class="btn btn-save" {{ 'disabled' if not storage_available else '' }}>💾 Lưu Owner ID</button>
+                </div>
+                <div class="owner-form">
+                    <input id="owner-id-input" class="owner-input" inputmode="numeric" maxlength="20" autocomplete="off" placeholder="Nhập Discord user ID">
+                    <button type="button" class="btn btn-save" onclick="addOwnerId()">➕ Thêm Owner ID</button>
+                </div>
+                <div id="owner-list" class="owner-list"></div>
+                <p class="summary">Luôn phải giữ lại ít nhất 1 Owner ID để tránh mất quyền điều khiển bot.</p>
+                <p id="owner-status" class="status {{ 'error' if not storage_available else '' }}" role="status">{{ 'JSONBin không khả dụng; chưa thể lưu Owner ID.' if not storage_available else '' }}</p>
+            </section>
+        </div>
+
+        <script>
+            const rosterList = document.getElementById('roster-list');
+            const serverList = document.getElementById('server-list');
+            const ownerList = document.getElementById('owner-list');
+            const ownerInput = document.getElementById('owner-id-input');
+            let ownerIds = {{ owner_ids | tojson }};
+            if (window.Sortable) {
+                new Sortable(rosterList, { animation: 150, draggable: '.agent-card', handle: '.handle' });
+                new Sortable(serverList, { animation: 150, draggable: '.server-card', handle: '.handle' });
             }
 
-            async function deleteAgent(id) {
-                if(!confirm('Xóa sạch dữ liệu của agent này?')) return;
-                const res = await fetch('/admin/api/delete/' + id, { method: 'POST' });
-                if((await res.json()).success) {
-                    document.querySelector(`.agent-card[data-id="${id}"]`).remove();
-                } else {
-                    alert('❌ Lỗi xóa!');
+            async function saveOrder(endpoint, selector, statusId, buttonId) {
+                const status = document.getElementById(statusId);
+                const button = document.getElementById(buttonId);
+                const order = Array.from(document.querySelectorAll(selector)).map(element => element.dataset.id);
+                status.className = 'status'; status.textContent = 'Đang lưu...'; button.disabled = true;
+                try {
+                    const response = await fetch(endpoint, {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({order})
+                    });
+                    const result = await response.json().catch(() => ({success:false,error:'Phản hồi không hợp lệ'}));
+                    if (!response.ok || !result.success) throw new Error(result.error || `HTTP ${response.status}`);
+                    status.className = 'status ok'; status.textContent = '✅ Đã lưu thứ tự.';
+                } catch (error) {
+                    status.className = 'status error'; status.textContent = `❌ Không thể lưu: ${error.message}`;
+                } finally { button.disabled = false; }
+            }
+
+            function saveAgentOrder() { return saveOrder('/admin/api/reorder', '.agent-card', 'agent-status', 'save-agent-order'); }
+            function saveServerOrder() { return saveOrder('/admin/api/reorder-servers', '.server-card', 'server-status', 'save-server-order'); }
+
+            function setOwnerStatus(message, type='') {
+                const status = document.getElementById('owner-status');
+                status.className = `status ${type}`.trim();
+                status.textContent = message;
+            }
+
+            function renderOwnerIds() {
+                ownerList.replaceChildren();
+                ownerIds.forEach(id => {
+                    const card = document.createElement('div');
+                    card.className = 'item-card owner-card';
+                    card.dataset.id = id;
+                    const info = document.createElement('div');
+                    info.className = 'item-info';
+                    const text = document.createElement('div');
+                    text.className = 'item-text';
+                    const name = document.createElement('div');
+                    name.className = 'item-name';
+                    name.textContent = 'Discord Owner';
+                    const value = document.createElement('div');
+                    value.className = 'item-id';
+                    value.textContent = id;
+                    text.append(name, value);
+                    info.append(text);
+                    const remove = document.createElement('button');
+                    remove.type = 'button';
+                    remove.className = 'btn btn-del';
+                    remove.textContent = '🗑️ Xóa';
+                    remove.addEventListener('click', () => removeOwnerId(id));
+                    card.append(info, remove);
+                    ownerList.append(card);
+                });
+            }
+
+            function addOwnerId() {
+                const id = ownerInput.value.trim();
+                if (!/^\\d+$/.test(id) || id === '0' || id.length > 20) {
+                    setOwnerStatus('❌ Discord user ID phải là số nguyên dương, tối đa 20 chữ số.', 'error');
+                    return;
                 }
+                const normalized = BigInt(id).toString();
+                if (ownerIds.includes(normalized)) {
+                    setOwnerStatus('❌ Owner ID này đã có trong danh sách.', 'error');
+                    return;
+                }
+                ownerIds.push(normalized);
+                ownerInput.value = '';
+                renderOwnerIds();
+                setOwnerStatus('Đã thêm tạm thời; bấm “Lưu Owner ID” để áp dụng.');
+            }
+
+            function removeOwnerId(id) {
+                if (ownerIds.length <= 1) {
+                    setOwnerStatus('❌ Phải giữ lại ít nhất 1 Owner ID.', 'error');
+                    return;
+                }
+                ownerIds = ownerIds.filter(value => value !== id);
+                renderOwnerIds();
+                setOwnerStatus('Đã xóa tạm thời; bấm “Lưu Owner ID” để áp dụng.');
+            }
+
+            async function saveOwnerIds() {
+                const button = document.getElementById('save-owner-ids');
+                setOwnerStatus('Đang lưu...');
+                button.disabled = true;
+                try {
+                    const response = await fetch('/admin/api/owner-ids', {
+                        method:'POST',
+                        headers:{'Content-Type':'application/json'},
+                        body:JSON.stringify({owner_ids:ownerIds})
+                    });
+                    const result = await response.json().catch(() => ({success:false,error:'Phản hồi không hợp lệ'}));
+                    if (!response.ok || !result.success) throw new Error(result.error || `HTTP ${response.status}`);
+                    ownerIds = result.owner_ids;
+                    renderOwnerIds();
+                    setOwnerStatus('✅ Đã lưu và áp dụng danh sách Owner ID.', 'ok');
+                } catch (error) {
+                    setOwnerStatus(`❌ Không thể lưu: ${error.message}`, 'error');
+                } finally {
+                    button.disabled = false;
+                }
+            }
+
+            ownerInput.addEventListener('keydown', event => {
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    addOwnerId();
+                }
+            });
+            renderOwnerIds();
+
+            async function deleteAgent(id) {
+                if (!confirm('Xóa dữ liệu agent này khỏi tất cả hệ thống lưu trữ?')) return;
+                const response = await fetch('/admin/api/delete/' + encodeURIComponent(id), { method:'POST' });
+                const result = await response.json().catch(() => ({success:false}));
+                if (response.ok && result.success) document.querySelector(`.agent-card[data-id="${id}"]`)?.remove();
+                else alert('❌ Không thể xóa agent.');
             }
         </script>
     </body>
     </html>
-    """, agents=agents)
+    """, agents=agents, servers=servers, owner_ids=owner_ids, bot_ready=bot_ready, storage_available=storage_available)
+
+
+def _admin_json_payload(field='order'):
+    if not request.is_json:
+        return None, (jsonify({"success": False, "error": "Content-Type must be application/json"}), 415)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or set(payload) != {field}:
+        error = f"expected JSON object with only a '{field}' field"
+        return None, (jsonify({"success": False, "error": error}), 400)
+    return payload, None
+
 
 @app.route('/admin/api/reorder', methods=['POST'])
 @login_required
 def api_reorder():
-    full_data = jsonbin_storage.read_data()
-    full_data['_roster_order'] = request.json.get('order', [])
-    jsonbin_storage.write_data(full_data)
-    return jsonify({"success": True})
+    payload, error_response = _admin_json_payload()
+    if error_response:
+        return error_response
+
+    storage_ok, full_data = jsonbin_storage.read_data_with_status()
+    if not storage_ok:
+        return jsonify({"success": False, "error": "JSONBin is unavailable"}), 503
+    known_ids = {uid for uid in full_data if isinstance(uid, str) and uid.isdigit()}
+
+    order = payload['order']
+    if not isinstance(order, list):
+        return jsonify({"success": False, "error": "'order' must be a list"}), 400
+    normalized_order = [str(uid).strip() for uid in order]
+    if any(not uid.isdigit() for uid in normalized_order):
+        return jsonify({"success": False, "error": "order contains an invalid account ID"}), 400
+    if len(normalized_order) != len(set(normalized_order)):
+        return jsonify({"success": False, "error": "order contains duplicate account IDs"}), 400
+    if any(uid not in known_ids for uid in normalized_order):
+        return jsonify({"success": False, "error": "order contains an unknown account ID"}), 400
+
+    if not jsonbin_storage.set_metadata('_roster_order', normalized_order):
+        return jsonify({"success": False, "error": "failed to persist account order"}), 502
+    return jsonify({"success": True, "order": normalized_order})
+
+
+@app.route('/admin/api/reorder-servers', methods=['POST'])
+@login_required
+def api_reorder_servers():
+    payload, error_response = _admin_json_payload()
+    if error_response:
+        return error_response
+    if not bot.is_ready():
+        return jsonify({"success": False, "error": "Discord bot is not ready"}), 503
+    if not JSONBIN_API_KEY or not JSONBIN_BIN_ID:
+        return jsonify({"success": False, "error": "JSONBin is not configured"}), 503
+
+    current_guilds = list(bot.guilds)
+    try:
+        normalized_order = validate_server_order(payload['order'], (guild.id for guild in current_guilds))
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    if not jsonbin_storage.set_metadata(SERVER_ORDER_KEY, normalized_order):
+        return jsonify({"success": False, "error": "failed to persist server order"}), 502
+
+    set_cached_server_order(normalized_order)
+    return jsonify({"success": True, "order": normalized_order})
+
+
+@app.route('/admin/api/owner-ids', methods=['POST'])
+@login_required
+def api_owner_ids():
+    payload, error_response = _admin_json_payload('owner_ids')
+    if error_response:
+        return error_response
+    if not JSONBIN_API_KEY or not JSONBIN_BIN_ID:
+        return jsonify({"success": False, "error": "JSONBin is not configured"}), 503
+
+    try:
+        owner_ids = validate_owner_ids(payload['owner_ids'])
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    if not jsonbin_storage.set_metadata(OWNER_IDS_KEY, owner_ids):
+        return jsonify({"success": False, "error": "failed to persist owner IDs"}), 502
+
+    set_bot_owner_ids(owner_ids)
+    return jsonify({"success": True, "owner_ids": owner_ids})
+
 
 @app.route('/admin/api/delete/<uid>', methods=['POST'])
 @login_required
 def api_delete_user(uid):
     # Gọi các hàm xóa từ các nguồn dữ liệu có sẵn trong file của bạn
-    try: delete_user_from_db(uid) 
-    except: pass
-    try: jsonbin_storage.delete_user(uid)
-    except: pass
-    try: delete_user_from_json(uid)
-    except: pass
+    try:
+        delete_user_from_db(uid)
+    except Exception:
+        pass
+    try:
+        jsonbin_storage.delete_user(uid)
+    except Exception:
+        pass
+    try:
+        delete_user_from_json(uid)
+    except Exception:
+        pass
     return jsonify({"success": True})
     
 # --- THREADING FUNCTION ---
@@ -3530,7 +3926,7 @@ if __name__ == '__main__':
         print("🌐 Testing JSONBin.io connection...")
         try:
             test_data = jsonbin_storage.read_data()
-            print(f"✅ JSONBin.io connected successfully")
+            print("✅ JSONBin.io connected successfully")
             if isinstance(test_data, dict) and len(test_data) > 0:
                 print(f"📊 Found {len(test_data)} existing tokens in JSONBin")
         except Exception as e:
