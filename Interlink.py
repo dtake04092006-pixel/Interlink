@@ -17,12 +17,16 @@ import functools
 
 from interlink_core import (
     AGENT_PAGE_SIZE,
+    DISABLED_SERVER_IDS_KEY,
     HELP_CATEGORY_META,
     OWNER_IDS_KEY,
     SERVER_ORDER_KEY,
     SERVER_PAGE_SIZE,
     help_commands_for,
+    normalize_snowflake,
     paginate_items,
+    partition_guilds,
+    reconcile_disabled_server_ids,
     reconcile_guild_order,
     replace_page_selection,
     validate_owner_ids,
@@ -452,6 +456,7 @@ app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'super_secret_key_change_me') # <--- DÁN VÀO ĐÂY
 
 _server_order_cache = []
+_disabled_server_ids_cache = []
 _server_order_cache_loaded = False
 _server_order_cache_lock = threading.Lock()
 
@@ -468,6 +473,31 @@ def set_cached_server_order(order):
 def get_cached_server_order():
     with _server_order_cache_lock:
         return list(_server_order_cache), _server_order_cache_loaded
+
+
+def set_cached_disabled_server_ids(disabled_ids):
+    """Replace the in-process disabled-server cache with a defensive copy."""
+    global _disabled_server_ids_cache, _server_order_cache_loaded
+    safe_ids = list(disabled_ids) if isinstance(disabled_ids, (list, tuple, set)) else []
+    with _server_order_cache_lock:
+        _disabled_server_ids_cache = safe_ids
+        _server_order_cache_loaded = True
+
+
+def get_cached_disabled_server_ids():
+    with _server_order_cache_lock:
+        return list(_disabled_server_ids_cache), _server_order_cache_loaded
+
+
+def set_cached_server_state(order, disabled_ids):
+    """Update order and disabled IDs together so readers see one consistent state."""
+    global _server_order_cache, _disabled_server_ids_cache, _server_order_cache_loaded
+    safe_order = list(order) if isinstance(order, (list, tuple)) else []
+    safe_disabled = list(disabled_ids) if isinstance(disabled_ids, (list, tuple, set)) else []
+    with _server_order_cache_lock:
+        _server_order_cache = safe_order
+        _disabled_server_ids_cache = safe_disabled
+        _server_order_cache_loaded = True
 
 
 def normalize_stored_owner_ids(owner_ids):
@@ -493,21 +523,26 @@ def get_bot_owner_ids():
 
 
 def refresh_server_order_cache():
-    """Refresh ordering metadata from JSONBin without raising into callers."""
+    """Refresh server/owner metadata from JSONBin without raising into callers."""
     if not JSONBIN_API_KEY or not JSONBIN_BIN_ID:
-        set_cached_server_order([])
+        set_cached_server_state([], [])
         return False
 
     success, full_data = jsonbin_storage.read_data_with_status()
     if success:
-        set_cached_server_order(full_data.get(SERVER_ORDER_KEY, []))
+        valid_guild_ids = [guild.id for guild in bot.guilds]
+        disabled_ids = reconcile_disabled_server_ids(
+            full_data.get(DISABLED_SERVER_IDS_KEY),
+            valid_guild_ids,
+        )
+        set_cached_server_state(full_data.get(SERVER_ORDER_KEY, []), disabled_ids)
         set_bot_owner_ids(full_data.get(OWNER_IDS_KEY))
         return True
 
     # Avoid retrying a failed synchronous service call on every Discord command.
     _, loaded = get_cached_server_order()
     if not loaded:
-        set_cached_server_order([])
+        set_cached_server_state([], [])
     return False
 
 
@@ -517,7 +552,9 @@ async def get_ordered_guilds(force_refresh=False):
     if force_refresh or not cache_loaded:
         await asyncio.to_thread(refresh_server_order_cache)
     order, _ = get_cached_server_order()
-    return reconcile_guild_order(bot.guilds, order)
+    disabled_ids, _ = get_cached_disabled_server_ids()
+    enabled_guilds, _ = partition_guilds(bot.guilds, disabled_ids)
+    return reconcile_guild_order(enabled_guilds, order)
 
 # --- UTILITY FUNCTIONS ---
 async def add_member_to_guild(guild_id: int, user_id: int, access_token: str):
@@ -1453,7 +1490,7 @@ async def create(ctx):
     """Mở giao diện tạo kênh hàng loạt."""
     sorted_guilds = await get_ordered_guilds()
     if not sorted_guilds:
-        return await ctx.send("❌ Bot chưa tham gia server nào để tạo kênh.")
+        return await ctx.send("❌ Không có server nào đang bật để tạo kênh.")
     
     view = CreateChannelView(ctx.author, sorted_guilds)
     
@@ -1671,7 +1708,7 @@ async def auth(ctx):
     )
     await ctx.send(embed=embed)
 
-@bot.command(name='add_me', help='Thêm bạn vào tất cả các server của bot.')
+@bot.command(name='add_me', help='Thêm bạn vào tất cả server đang bật trên web admin.')
 async def add_me(ctx):
     user_id = ctx.author.id
     await ctx.send(f"✅ Bắt đầu quá trình thêm {ctx.author.mention} vào các server...")
@@ -1685,11 +1722,15 @@ async def add_me(ctx):
         )
         await ctx.send(embed=embed)
         return
+
+    guilds = await get_ordered_guilds()
+    if not guilds:
+        return await ctx.send("❌ Không có server nào đang bật để thêm bạn.")
     
     success_count = 0
     fail_count = 0
     
-    for guild in bot.guilds:
+    for guild in guilds:
         await asyncio.sleep(2)
         try:
             member = guild.get_member(user_id)
@@ -1748,15 +1789,20 @@ async def status(ctx):
     # Test JSONBin connection
     jsonbin_status = "✅ Configured" if JSONBIN_API_KEY else "❌ Not configured"
     
+    active_guilds = await get_ordered_guilds()
     embed = discord.Embed(title="🤖 Trạng thái Bot", color=0x0099ff)
-    embed.add_field(name="📊 Server", value=f"{len(bot.guilds)} server", inline=True)
+    embed.add_field(
+        name="📊 Server",
+        value=f"{len(active_guilds)} đang bật / {len(bot.guilds)} bot đã tham gia",
+        inline=True,
+    )
     embed.add_field(name="👥 Người dùng", value=f"{len(bot.users)} user", inline=True)
     embed.add_field(name="💾 Database", value=db_status, inline=True)
     embed.add_field(name="🌐 JSONBin.io", value=jsonbin_status, inline=True)
     embed.add_field(name="🌍 Web Server", value=f"[Truy cập]({RENDER_URL})", inline=False)
     await ctx.send(embed=embed)
     
-@bot.command(name='force_add', help='(Chủ bot) Thêm một người dùng bất kỳ vào tất cả các server.')
+@bot.command(name='force_add', help='(Chủ bot) Thêm một người dùng vào tất cả server đang bật.')
 @commands.is_owner()
 async def force_add(ctx, user_to_add: discord.User):
     """
@@ -1775,11 +1821,15 @@ async def force_add(ctx, user_to_add: discord.User):
         )
         await ctx.send(embed=embed)
         return
+
+    guilds = await get_ordered_guilds()
+    if not guilds:
+        return await ctx.send("❌ Không có server nào đang bật để thêm người dùng.")
     
     success_count = 0
     fail_count = 0
     
-    for guild in bot.guilds:
+    for guild in guilds:
         await asyncio.sleep(2)
         try:
             member = guild.get_member(user_id)
@@ -1828,7 +1878,7 @@ async def invite(ctx, user_to_add: discord.User):
         
     guilds = await get_ordered_guilds()
     if not guilds:
-        return await ctx.send("❌ Bot chưa tham gia server nào để thực hiện lời mời.")
+        return await ctx.send("❌ Không có server nào đang bật để thực hiện lời mời.")
 
     view = ServerSelectView(author=ctx.author, target_user=user_to_add, guilds=guilds)
     
@@ -1855,6 +1905,7 @@ def build_help_embed(category, is_owner):
             "Chọn một nhóm trong menu để xem **cú pháp, quyền, tác dụng, tham số, "
             "ví dụ và cảnh báo** của từng lệnh.\n\n"
             f"• Menu server hiển thị tối đa **{SERVER_PAGE_SIZE} server/trang**.\n"
+            "• Server tắt trên web admin bị loại khỏi menu và tác vụ hàng loạt.\n"
             "• Các thao tác thêm thành viên cần người dùng hoàn tất `!auth`.\n"
             "• Không gửi access token, mật khẩu hay mã OTP vào Discord."
         )
@@ -2277,7 +2328,7 @@ async def deploy(ctx):
 
     guilds = await get_ordered_guilds()
     if not guilds:
-        return await ctx.send("❌ Bot chưa tham gia server nào để triển khai.")
+        return await ctx.send("❌ Không có server nào đang bật để triển khai.")
     
     view = DeployView(ctx.author, guilds, agents)
     
@@ -2296,7 +2347,7 @@ async def getid(ctx):
     """Mở giao diện để tìm ID kênh."""
     sorted_guilds = await get_ordered_guilds()
     if not sorted_guilds:
-        return await ctx.send("❌ Bot chưa tham gia server nào để tìm kênh.")
+        return await ctx.send("❌ Không có server nào đang bật để tìm kênh.")
     
     # Truyền danh sách đã sắp xếp vào View mới
     view = GetIdPaginatedView(ctx.author, sorted_guilds)
@@ -2387,7 +2438,7 @@ async def kick(ctx):
     
     guilds = await get_ordered_guilds()
     if not guilds:
-        return await ctx.send("❌ Bot chưa tham gia server nào để thực hiện kick.")
+        return await ctx.send("❌ Không có server nào đang bật để thực hiện kick.")
     
     view = KickView(ctx.author, guilds, agents)
     
@@ -2400,23 +2451,26 @@ async def kick(ctx):
     
     await ctx.send(embed=embed, view=view)
     
-@bot.command(name='setupadmin', help='(Chủ bot) Tạo và cấp vai trò quản trị cho một thành viên trên tất cả các server.')
+@bot.command(name='setupadmin', help='(Chủ bot) Cấp vai trò quản trị trên tất cả server đang bật.')
 @commands.is_owner()
 async def setupadmin(ctx, member_to_grant: discord.Member):
     """
     Tạo một vai trò có quyền quản trị viên và gán nó cho một thành viên
-    trên tất cả các server mà bot có mặt.
+    trên tất cả server đang bật trong web admin.
     Lệnh này chỉ dành cho chủ bot.
     Cách dùng: !setupadmin @TênThànhViên
     """
     role_name = "Server Controller"
     permissions = discord.Permissions(administrator=True)
+    guilds = await get_ordered_guilds()
+    if not guilds:
+        return await ctx.send("❌ Không có server nào đang bật để cấp quyền.")
     
     # Tin nhắn cảnh báo và xác nhận
     warning_embed = discord.Embed(
         title="⚠️ Cảnh Báo Bảo Mật",
-        description=f"Bạn sắp tạo vai trò **{role_name}** với quyền **QUẢN TRỊ VIÊN** và cấp nó cho **{member_to_grant.mention}** trên **{len(bot.guilds)}** server.\n\n"
-                    "Hành động này rất nguy hiểm và không thể hoàn tác. Người này sẽ có toàn quyền kiểm soát trên tất cả các server. Bạn có chắc chắn muốn tiếp tục không?",
+        description=f"Bạn sắp tạo vai trò **{role_name}** với quyền **QUẢN TRỊ VIÊN** và cấp nó cho **{member_to_grant.mention}** trên **{len(guilds)}** server đang bật.\n\n"
+                    "Hành động này rất nguy hiểm và không thể hoàn tác. Người này sẽ có toàn quyền kiểm soát trên các server đang bật. Bạn có chắc chắn muốn tiếp tục không?",
         color=discord.Color.orange()
     )
     
@@ -2458,13 +2512,13 @@ async def setupadmin(ctx, member_to_grant: discord.Member):
         return await confirm_message.edit(content="Đã hủy hành động.", embed=None, view=None)
 
     # Nếu người dùng xác nhận, tiếp tục thực thi
-    await confirm_message.edit(content=f"✅ **Đã xác nhận!** Bắt đầu quá trình trên **{len(bot.guilds)}** server...", embed=None, view=None)
+    await confirm_message.edit(content=f"✅ **Đã xác nhận!** Bắt đầu quá trình trên **{len(guilds)}** server đang bật...", embed=None, view=None)
     
     success_count = 0
     fail_count = 0
     failure_details = []
 
-    for guild in bot.guilds:
+    for guild in guilds:
         await asyncio.sleep(2)
         try:
             # 1. Kiểm tra xem thành viên có trong server không
@@ -3554,14 +3608,22 @@ def admin_dashboard():
     bot_ready = bot.is_ready()
     current_guilds = list(bot.guilds) if bot_ready else []
     if storage_available:
-        set_cached_server_order(full_data.get(SERVER_ORDER_KEY, []))
         owner_ids = set_bot_owner_ids(full_data.get(OWNER_IDS_KEY))
+        if bot_ready:
+            disabled_ids = reconcile_disabled_server_ids(
+                full_data.get(DISABLED_SERVER_IDS_KEY),
+                (guild.id for guild in current_guilds),
+            )
+            set_cached_server_state(full_data.get(SERVER_ORDER_KEY, []), disabled_ids)
     else:
         owner_ids = get_bot_owner_ids()
     cached_order, _ = get_cached_server_order()
+    disabled_ids, _ = get_cached_disabled_server_ids()
 
     agents = build_admin_agents(full_data)
-    servers = build_admin_servers(current_guilds, cached_order)
+    enabled_guilds, disabled_guilds = partition_guilds(current_guilds, disabled_ids)
+    servers = build_admin_servers(enabled_guilds, cached_order)
+    disabled_servers = build_admin_servers(disabled_guilds, cached_order)
 
     return render_template_string("""
     <!DOCTYPE html>
@@ -3593,6 +3655,8 @@ def admin_dashboard():
             .btn:disabled { opacity:.45; cursor:not-allowed; }
             .btn-save { background:var(--green); }
             .btn-del { background:var(--red); font-size:.8rem; }
+            .btn-disable { background:#9a5b00; font-size:.8rem; }
+            .btn-enable { background:var(--green); font-size:.8rem; }
             .btn-logout { background:#555; }
             .status { min-height:1.3em; margin:10px 0 0; color:var(--muted); font-size:.9rem; }
             .status.ok { color:#66d987; } .status.error { color:#ff7777; }
@@ -3602,6 +3666,9 @@ def admin_dashboard():
             .owner-input { min-width:0; flex:1; border:1px solid #555; border-radius:5px; background:#181818; color:#fff; padding:10px 12px; font:inherit; }
             .owner-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:8px; }
             .owner-card { margin:0; cursor:default; }
+            .server-subheading { color:#ddd; margin:18px 0 8px; font-size:1rem; }
+            .disabled-server-card { cursor:default; opacity:.82; border-style:dashed; }
+            [hidden] { display:none !important; }
             @media (max-width:800px) { .dashboard-grid { grid-template-columns:1fr; } .header { align-items:flex-start; } }
             @media (max-width:520px) { body { padding:12px; } .header,.panel-header,.owner-form { flex-direction:column; } .header > .btn,.panel-header > .btn,.owner-form > .btn { width:100%; text-align:center; } }
         </style>
@@ -3638,7 +3705,7 @@ def admin_dashboard():
 
             <section class="panel" id="server-panel">
                 <div class="panel-header">
-                    <div><h2>🖥️ Discord Server</h2><p class="summary">Thứ tự này được dùng trong menu chọn server của bot.</p></div>
+                    <div><h2>🖥️ Discord Server</h2><p class="summary">Kéo để sắp xếp; tắt để loại server khỏi mọi tác vụ của bot.</p></div>
                     <button id="save-server-order" onclick="saveServerOrder()" class="btn btn-save" {{ 'disabled' if not bot_ready or not storage_available else '' }}>💾 Lưu server</button>
                 </div>
                 <div id="server-list">
@@ -3649,8 +3716,24 @@ def admin_dashboard():
                             <img src="{{ server.icon }}" class="avatar" alt="" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">
                             <div class="item-text"><div class="item-name">{{ server.name }}</div><div class="item-id">{{ server.id }}</div></div>
                         </div>
+                        <button type="button" onclick="setServerEnabled('{{ server.id }}', false, this)" class="btn btn-disable server-toggle" {{ 'disabled' if not bot_ready or not storage_available else '' }}>⏻ Tắt</button>
                     </div>
-                    {% else %}<div class="empty">Bot chưa sẵn sàng hoặc chưa tham gia server nào.</div>{% endfor %}
+                    {% endfor %}
+                    <div id="active-server-empty" class="empty" {{ '' if not servers else 'hidden' }}>Không có server nào đang bật.</div>
+                </div>
+                <h3 class="server-subheading">⏸️ Server đã tắt</h3>
+                <p class="summary">Các server này không xuất hiện trong menu chọn và không nhận tác vụ hàng loạt.</p>
+                <div id="disabled-server-list">
+                    {% for server in disabled_servers %}
+                    <div class="item-card disabled-server-card" data-id="{{ server.id }}">
+                        <div class="item-info">
+                            <img src="{{ server.icon }}" class="avatar" alt="" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">
+                            <div class="item-text"><div class="item-name">{{ server.name }}</div><div class="item-id">{{ server.id }}</div></div>
+                        </div>
+                        <button type="button" onclick="setServerEnabled('{{ server.id }}', true, this)" class="btn btn-enable server-toggle" {{ 'disabled' if not bot_ready or not storage_available else '' }}>▶️ Bật lại</button>
+                    </div>
+                    {% endfor %}
+                    <div id="disabled-server-empty" class="empty" {{ '' if not disabled_servers else 'hidden' }}>Chưa tắt server nào.</div>
                 </div>
                 <p id="server-status" class="status {{ 'error' if not bot_ready or not storage_available else '' }}" role="status">{% if not bot_ready %}Bot chưa sẵn sàng; chưa thể lưu thứ tự server.{% elif not storage_available %}JSONBin không khả dụng; chưa thể lưu thứ tự server.{% endif %}</p>
             </section>
@@ -3673,6 +3756,7 @@ def admin_dashboard():
         <script>
             const rosterList = document.getElementById('roster-list');
             const serverList = document.getElementById('server-list');
+            const disabledServerList = document.getElementById('disabled-server-list');
             const ownerList = document.getElementById('owner-list');
             const ownerInput = document.getElementById('owner-id-input');
             let ownerIds = {{ owner_ids | tojson }};
@@ -3701,6 +3785,74 @@ def admin_dashboard():
 
             function saveAgentOrder() { return saveOrder('/admin/api/reorder', '.agent-card', 'agent-status', 'save-agent-order'); }
             function saveServerOrder() { return saveOrder('/admin/api/reorder-servers', '.server-card', 'server-status', 'save-server-order'); }
+
+            function setServerStatus(message, type='') {
+                const status = document.getElementById('server-status');
+                status.className = `status ${type}`.trim();
+                status.textContent = message;
+            }
+
+            function refreshServerEmptyStates() {
+                document.getElementById('active-server-empty').hidden = Boolean(serverList.querySelector('.server-card'));
+                document.getElementById('disabled-server-empty').hidden = Boolean(disabledServerList.querySelector('.disabled-server-card'));
+            }
+
+            function moveServerCard(card, enabled) {
+                const id = card.dataset.id;
+                const info = card.querySelector('.item-info');
+                let handle = info.querySelector('.handle');
+                if (enabled && !handle) {
+                    handle = document.createElement('span');
+                    handle.className = 'handle';
+                    handle.textContent = '☰';
+                    info.prepend(handle);
+                } else if (!enabled && handle) {
+                    handle.remove();
+                }
+
+                const button = card.querySelector('.server-toggle');
+                button.disabled = false;
+                if (enabled) {
+                    card.className = 'item-card server-card';
+                    button.className = 'btn btn-disable server-toggle';
+                    button.textContent = '⏻ Tắt';
+                    button.onclick = () => setServerEnabled(id, false, button);
+                    serverList.append(card);
+                } else {
+                    card.className = 'item-card disabled-server-card';
+                    button.className = 'btn btn-enable server-toggle';
+                    button.textContent = '▶️ Bật lại';
+                    button.onclick = () => setServerEnabled(id, true, button);
+                    disabledServerList.append(card);
+                }
+                refreshServerEmptyStates();
+            }
+
+            async function setServerEnabled(id, enabled, button) {
+                const card = button.closest('.item-card');
+                const serverName = card.querySelector('.item-name').textContent;
+                button.disabled = true;
+                setServerStatus(enabled ? `Đang bật lại ${serverName}...` : `Đang tắt ${serverName}...`);
+                try {
+                    const response = await fetch('/admin/api/server-state', {
+                        method:'POST',
+                        headers:{'Content-Type':'application/json'},
+                        body:JSON.stringify({server_id:id, enabled})
+                    });
+                    const result = await response.json().catch(() => ({success:false,error:'Phản hồi không hợp lệ'}));
+                    if (!response.ok || !result.success) throw new Error(result.error || `HTTP ${response.status}`);
+                    moveServerCard(card, result.enabled);
+                    setServerStatus(
+                        result.enabled ? `✅ Đã bật lại ${serverName}.` : `✅ Đã tắt ${serverName} và loại khỏi danh sách hoạt động.`,
+                        'ok'
+                    );
+                } catch (error) {
+                    button.disabled = false;
+                    setServerStatus(`❌ Không thể cập nhật server: ${error.message}`, 'error');
+                }
+            }
+
+            refreshServerEmptyStates();
 
             function setOwnerStatus(message, type='') {
                 const status = document.getElementById('owner-status');
@@ -3803,15 +3955,18 @@ def admin_dashboard():
         </script>
     </body>
     </html>
-    """, agents=agents, servers=servers, owner_ids=owner_ids, bot_ready=bot_ready, storage_available=storage_available)
+    """, agents=agents, servers=servers, disabled_servers=disabled_servers, owner_ids=owner_ids,
+    bot_ready=bot_ready, storage_available=storage_available)
 
 
-def _admin_json_payload(field='order'):
+def _admin_json_payload(fields='order'):
     if not request.is_json:
         return None, (jsonify({"success": False, "error": "Content-Type must be application/json"}), 415)
     payload = request.get_json(silent=True)
-    if not isinstance(payload, dict) or set(payload) != {field}:
-        error = f"expected JSON object with only a '{field}' field"
+    expected_fields = {fields} if isinstance(fields, str) else set(fields)
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        expected = ", ".join(f"'{field}'" for field in sorted(expected_fields))
+        error = f"expected JSON object with exactly these fields: {expected}"
         return None, (jsonify({"success": False, "error": error}), 400)
     return payload, None
 
@@ -3856,8 +4011,10 @@ def api_reorder_servers():
         return jsonify({"success": False, "error": "JSONBin is not configured"}), 503
 
     current_guilds = list(bot.guilds)
+    disabled_ids, _ = get_cached_disabled_server_ids()
+    enabled_guilds, _ = partition_guilds(current_guilds, disabled_ids)
     try:
-        normalized_order = validate_server_order(payload['order'], (guild.id for guild in current_guilds))
+        normalized_order = validate_server_order(payload['order'], (guild.id for guild in enabled_guilds))
     except ValueError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
 
@@ -3866,6 +4023,54 @@ def api_reorder_servers():
 
     set_cached_server_order(normalized_order)
     return jsonify({"success": True, "order": normalized_order})
+
+
+@app.route('/admin/api/server-state', methods=['POST'])
+@login_required
+def api_server_state():
+    payload, error_response = _admin_json_payload({'server_id', 'enabled'})
+    if error_response:
+        return error_response
+    if not bot.is_ready():
+        return jsonify({"success": False, "error": "Discord bot is not ready"}), 503
+    if not JSONBIN_API_KEY or not JSONBIN_BIN_ID:
+        return jsonify({"success": False, "error": "JSONBin is not configured"}), 503
+    if not isinstance(payload['enabled'], bool):
+        return jsonify({"success": False, "error": "'enabled' must be a boolean"}), 400
+
+    guild_id = normalize_snowflake(payload['server_id'])
+    if guild_id is None:
+        return jsonify({"success": False, "error": "invalid server ID"}), 400
+    guild_id = str(int(guild_id))
+    current_guilds = list(bot.guilds)
+    current_ids = {str(guild.id) for guild in current_guilds}
+    if guild_id not in current_ids:
+        return jsonify({"success": False, "error": f"unknown server ID: {guild_id}"}), 400
+
+    enabled = payload['enabled']
+    updated_disabled_ids = []
+
+    def update_server_state(data):
+        nonlocal updated_disabled_ids
+        disabled = set(reconcile_disabled_server_ids(data.get(DISABLED_SERVER_IDS_KEY), current_ids))
+        if enabled:
+            disabled.discard(guild_id)
+        else:
+            disabled.add(guild_id)
+        ordered_guilds = reconcile_guild_order(current_guilds, data.get(SERVER_ORDER_KEY))
+        updated_disabled_ids = [str(guild.id) for guild in ordered_guilds if str(guild.id) in disabled]
+        data[DISABLED_SERVER_IDS_KEY] = updated_disabled_ids
+
+    if not jsonbin_storage.update_data(update_server_state):
+        return jsonify({"success": False, "error": "failed to persist server state"}), 502
+
+    set_cached_disabled_server_ids(updated_disabled_ids)
+    return jsonify({
+        "success": True,
+        "server_id": guild_id,
+        "enabled": enabled,
+        "disabled_server_ids": updated_disabled_ids,
+    })
 
 
 @app.route('/admin/api/owner-ids', methods=['POST'])

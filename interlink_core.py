@@ -15,6 +15,7 @@ T = TypeVar("T")
 SERVER_PAGE_SIZE = 20
 AGENT_PAGE_SIZE = 25
 SERVER_ORDER_KEY = "_server_order"
+DISABLED_SERVER_IDS_KEY = "_disabled_server_ids"
 OWNER_IDS_KEY = "_owner_ids"
 
 
@@ -56,6 +57,37 @@ def validate_server_order(order: Any, valid_ids: Iterable[Any]) -> list[str]:
         seen.add(guild_id)
 
     return normalized_order
+
+
+def reconcile_disabled_server_ids(disabled_ids: Any, valid_ids: Iterable[Any]) -> list[str]:
+    """Normalize stored disabled IDs while ignoring invalid, duplicate, and stale entries."""
+    allowed = {normalize_snowflake(value) for value in valid_ids}
+    allowed.discard(None)
+    candidates = disabled_ids if isinstance(disabled_ids, (list, tuple, set)) else ()
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for value in candidates:
+        guild_id = normalize_snowflake(value)
+        if guild_id is None or guild_id in seen or guild_id not in allowed:
+            continue
+        normalized.append(guild_id)
+        seen.add(guild_id)
+
+    return normalized
+
+
+def partition_guilds(guilds: Iterable[T], disabled_ids: Any) -> tuple[list[T], list[T]]:
+    """Split guilds into enabled and disabled lists without changing their order."""
+    guild_list = list(guilds)
+    guild_ids = (getattr(guild, "id", None) for guild in guild_list)
+    disabled = set(reconcile_disabled_server_ids(disabled_ids, guild_ids))
+    enabled_guilds: list[T] = []
+    disabled_guilds: list[T] = []
+    for guild in guild_list:
+        guild_id = normalize_snowflake(getattr(guild, "id", None))
+        (disabled_guilds if guild_id in disabled else enabled_guilds).append(guild)
+    return enabled_guilds, disabled_guilds
 
 
 def validate_owner_ids(owner_ids: Any) -> list[str]:
@@ -173,8 +205,8 @@ HELP_COMMANDS = (
         "category": "public",
         "syntax": "!add_me",
         "permission": "Mọi người đã chạy `!auth`",
-        "summary": "Thử thêm chính người gọi vào tất cả server mà bot đang tham gia.",
-        "details": "Bot báo tổng số lần thành công/thất bại. Quá trình có khoảng chờ để hạn chế rate limit và có thể mất thời gian.",
+        "summary": "Thử thêm chính người gọi vào tất cả server đang bật trong web admin.",
+        "details": "Bot bỏ qua server đã tắt, báo tổng số lần thành công/thất bại và giữ khoảng chờ để hạn chế rate limit.",
     },
     {
         "name": "check_token",
@@ -189,7 +221,7 @@ HELP_COMMANDS = (
         "category": "public",
         "syntax": "!status",
         "permission": "Mọi người",
-        "summary": "Hiển thị số server/user, trạng thái PostgreSQL, cấu hình JSONBin và liên kết web.",
+        "summary": "Hiển thị số server đang bật/tổng server, số user, trạng thái PostgreSQL, JSONBin và liên kết web.",
         "details": "Đây là chẩn đoán nhanh; trạng thái “configured” không đảm bảo một lần ghi dữ liệu sau đó sẽ thành công.",
     },
     {
@@ -213,8 +245,8 @@ HELP_COMMANDS = (
         "category": "owner",
         "syntax": "!force_add <@user|user_id>",
         "permission": "Owner",
-        "summary": "Thử thêm một người dùng vào tất cả server của bot.",
-        "details": "Người đó phải hoàn tất `!auth`. Ví dụ: `!force_add @Agent`; có khoảng chờ giữa các server.",
+        "summary": "Thử thêm một người dùng vào tất cả server đang bật trong web admin.",
+        "details": "Người đó phải hoàn tất `!auth`. Ví dụ: `!force_add @Agent`; server đã tắt bị bỏ qua và có khoảng chờ giữa các server.",
     },
     {
         "name": "invite",
@@ -294,7 +326,7 @@ HELP_COMMANDS = (
         "syntax": "!setupadmin <@member|member_id>",
         "permission": "Owner",
         "summary": "Tạo/tìm role `Server Controller` có Administrator rồi cấp trên mọi server.",
-        "details": "⚠️ Quyền rất cao. Lệnh có bước xác nhận 30 giây; member phải có trong từng server và bot cần Manage Roles.",
+        "details": "⚠️ Quyền rất cao. Lệnh chỉ chạy trên server đang bật, có bước xác nhận 30 giây; member phải có trong từng server và bot cần Manage Roles.",
     },
     {
         "name": "create",

@@ -9,6 +9,7 @@ Interlink kết hợp Discord bot, OAuth2 và Flask web admin để quản lý d
 - Menu chọn server phân trang tối đa 20 server/trang và giữ lựa chọn khi chuyển trang.
 - Web admin sắp xếp riêng account/agent và Discord server bằng kéo-thả.
 - Thứ tự server lưu tại `_server_order` được dùng trong các menu `!invite`, `!deploy`, `!kick`, `!create` và `!getid`.
+- Có thể tắt/bật lại server trên web; server tắt được lưu tại `_disabled_server_ids` và bị loại khỏi menu chọn cùng các tác vụ hàng loạt mà không làm bot rời server.
 - Web admin quản lý nhiều Discord Owner ID; danh sách lưu tại `_owner_ids` và được áp dụng ngay cho các lệnh Owner.
 - `!help` và `/help` dùng chung nội dung hướng dẫn theo nhóm quyền.
 
@@ -22,7 +23,7 @@ Interlink kết hợp Discord bot, OAuth2 và Flask web admin để quản lý d
 | --- | --- |
 | `!ping` | Kiểm tra độ trễ Discord của bot. |
 | `!auth` | Tạo liên kết OAuth cần thiết trước khi thêm người dùng vào server. |
-| `!add_me` | Thử thêm chính người gọi vào tất cả server của bot. |
+| `!add_me` | Thử thêm chính người gọi vào tất cả server đang bật. |
 | `!check_token` | Kiểm tra hệ thống có access token của người gọi hay chưa. |
 | `!status` | Xem trạng thái bot và các backend lưu trữ. |
 | `!help` hoặc `/help` | Mở hướng dẫn chi tiết theo danh mục. |
@@ -37,7 +38,7 @@ Interlink kết hợp Discord bot, OAuth2 và Flask web admin để quản lý d
 
 | Lệnh | Tác dụng |
 | --- | --- |
-| `!force_add <@user\|user_id>` | Thêm một người đã OAuth vào tất cả server. |
+| `!force_add <@user\|user_id>` | Thêm một người đã OAuth vào tất cả server đang bật. |
 | `!invite <@user\|user_id>` | Chọn nhiều server để thêm một người đã OAuth. |
 | `!storage_info` | Xem trạng thái và số bản ghi của storage. |
 | `!migrate_tokens <source> <target>` | Sao chép token giữa `db`, `jsonbin`, `json`. |
@@ -47,7 +48,7 @@ Interlink kết hợp Discord bot, OAuth2 và Flask web admin để quản lý d
 | `!deploy` | Chọn nhiều agent và nhiều server để thêm hàng loạt. |
 | `!getid` | Tìm ID text channel theo tên trong các server đã chọn. |
 | `!kick` | Kick nhiều agent khỏi các server đã chọn. |
-| `!setupadmin <@member\|member_id>` | Cấp role Administrator trên nhiều server sau bước xác nhận. |
+| `!setupadmin <@member\|member_id>` | Cấp role Administrator trên các server đang bật sau bước xác nhận. |
 | `!create` | Tạo 1–5 text channel trong nhiều server. |
 
 Chạy `!help` hoặc `/help` để xem quyền, tham số, ví dụ, điều kiện tiên quyết và cảnh báo chi tiết của từng lệnh.
@@ -58,8 +59,9 @@ Chạy `!help` hoặc `/help` để xem quyền, tham số, ví dụ, điều ki
 - `/admin/dashboard` có hai danh sách kéo-thả độc lập và một khu vực quản lý Owner ID:
   - Account/agent lưu qua API cũ `/admin/api/reorder` vào `_roster_order`.
   - Discord server lưu qua `/admin/api/reorder-servers` vào `_server_order`.
+  - Nút **Tắt** loại server khỏi danh sách hoạt động ngay lập tức; khu vực **Server đã tắt** cho phép bật lại qua `/admin/api/server-state`.
   - Có thể thêm nhiều Discord user ID làm Owner, xóa ID không còn dùng rồi lưu qua `/admin/api/owner-ids` vào `_owner_ids`. Hệ thống không cho lưu danh sách rỗng để tránh tự khóa quyền quản trị bot.
-- Endpoint server chỉ chấp nhận ID server mà bot đang tham gia và từ chối lưu nếu bot chưa sẵn sàng hoặc JSONBin không khả dụng.
+- Endpoint server chỉ chấp nhận ID server mà bot đang tham gia và từ chối thay đổi nếu bot chưa sẵn sàng hoặc JSONBin không khả dụng. Việc tắt server không kick bot và có thể hoàn tác trên dashboard.
 
 ## Biến môi trường
 

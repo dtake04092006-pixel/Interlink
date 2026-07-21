@@ -17,11 +17,14 @@ os.environ.setdefault("ADMIN_PASSWORD", "test-admin-password")
 import Interlink  # noqa: E402
 from interlink_core import (  # noqa: E402
     AGENT_PAGE_SIZE,
+    DISABLED_SERVER_IDS_KEY,
     OWNER_IDS_KEY,
     SERVER_ORDER_KEY,
     SERVER_PAGE_SIZE,
     documented_command_names,
     paginate_items,
+    partition_guilds,
+    reconcile_disabled_server_ids,
     reconcile_guild_order,
     replace_page_selection,
     validate_owner_ids,
@@ -185,6 +188,13 @@ class ServerOrderingTests(unittest.TestCase):
         ordered = reconcile_guild_order(self.guilds, ["2", "2", "999", None, "bad", 1])
         self.assertEqual([guild.id for guild in ordered], [2, 1, 3, 4])
 
+    def test_disabled_ids_are_normalized_and_guilds_are_partitioned(self):
+        disabled_ids = reconcile_disabled_server_ids([2, "2", "999", None, "bad"], [1, 2, 3])
+        self.assertEqual(disabled_ids, ["2"])
+        enabled, disabled = partition_guilds(self.guilds, disabled_ids)
+        self.assertEqual([guild.id for guild in enabled], [3, 1, 4])
+        self.assertEqual([guild.id for guild in disabled], [2])
+
     def test_validate_server_order_normalizes_and_rejects_bad_input(self):
         self.assertEqual(validate_server_order([2, "1"], [1, 2]), ["2", "1"])
         with self.assertRaisesRegex(ValueError, "list"):
@@ -207,6 +217,26 @@ class ServerOrderingTests(unittest.TestCase):
         for callback in command_callbacks:
             with self.subTest(command=callback.__name__):
                 self.assertIn("get_ordered_guilds", inspect.getsource(callback))
+
+    def test_all_server_bulk_commands_use_active_guild_filter(self):
+        command_callbacks = (
+            Interlink.add_me.callback,
+            Interlink.force_add.callback,
+            Interlink.setupadmin.callback,
+            Interlink.status.callback,
+        )
+        for callback in command_callbacks:
+            with self.subTest(command=callback.__name__):
+                self.assertIn("get_ordered_guilds", inspect.getsource(callback))
+
+
+class ActiveGuildTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ordered_guilds_excludes_disabled_servers(self):
+        guilds = [FakeGuild(1), FakeGuild(2), FakeGuild(3)]
+        Interlink.set_cached_server_state(["3", "2", "1"], ["2"])
+        with patch.object(Interlink, "bot", FakeBot(guilds, ready=True)):
+            active = await Interlink.get_ordered_guilds()
+        self.assertEqual([guild.id for guild in active], [3, 1])
 
 
 class OwnerIdTests(unittest.TestCase):
@@ -234,12 +264,17 @@ class OwnerIdTests(unittest.TestCase):
         self.assertEqual(Interlink.normalize_stored_owner_ids([]), list(Interlink.DEFAULT_OWNER_IDS))
 
     def test_metadata_refresh_applies_saved_owner_ids(self):
-        fake_bot = FakeBot(ready=True)
-        metadata = {SERVER_ORDER_KEY: [], OWNER_IDS_KEY: ["123", "456"]}
+        fake_bot = FakeBot([FakeGuild(10), FakeGuild(20)], ready=True)
+        metadata = {
+            SERVER_ORDER_KEY: ["20", "10"],
+            DISABLED_SERVER_IDS_KEY: ["10", "999"],
+            OWNER_IDS_KEY: ["123", "456"],
+        }
         with patch.object(Interlink, "bot", fake_bot), \
              patch.object(Interlink.jsonbin_storage, "read_data_with_status", return_value=(True, metadata)):
             self.assertTrue(Interlink.refresh_server_order_cache())
         self.assertEqual(fake_bot.owner_ids, {123, 456})
+        self.assertEqual(Interlink.get_cached_disabled_server_ids()[0], ["10"])
 
 
 class OwnerPermissionTests(unittest.IsolatedAsyncioTestCase):
@@ -264,6 +299,7 @@ class JSONBinMetadataTests(unittest.TestCase):
         self.original = {
             "123": {"access_token": "secret-token", "username": "Agent"},
             "_roster_order": ["123"],
+            DISABLED_SERVER_IDS_KEY: ["789"],
             OWNER_IDS_KEY: ["456"],
             "tracked_channels": {"1": ["2"]},
             "unknown_metadata": {"keep": True},
@@ -292,7 +328,7 @@ class AdminRoutesTests(unittest.TestCase):
     def setUp(self):
         Interlink.app.config.update(TESTING=True, SECRET_KEY="test-secret")
         self.client = Interlink.app.test_client()
-        Interlink.set_cached_server_order([])
+        Interlink.set_cached_server_state([], [])
 
     def login(self):
         with self.client.session_transaction() as session:
@@ -336,6 +372,96 @@ class AdminRoutesTests(unittest.TestCase):
             response = self.client.post("/admin/api/reorder-servers", json={"order": ["1"]})
         self.assertEqual(response.status_code, 502)
         self.assertFalse(response.get_json()["success"])
+
+    def test_server_state_api_requires_login_and_validates_payload(self):
+        response = self.client.post("/admin/api/server-state", json={"server_id": "1", "enabled": False})
+        self.assertEqual(response.status_code, 401)
+
+        self.login()
+        ready_bot = FakeBot([FakeGuild(1)], ready=True)
+        with patch.object(Interlink, "bot", ready_bot):
+            self.assertEqual(self.client.post("/admin/api/server-state", data="x").status_code, 415)
+            self.assertEqual(self.client.post("/admin/api/server-state", json={"server_id": "1"}).status_code, 400)
+            self.assertEqual(
+                self.client.post("/admin/api/server-state", json={"server_id": "1", "enabled": "false"}).status_code,
+                400,
+            )
+            self.assertEqual(
+                self.client.post("/admin/api/server-state", json={"server_id": "bad", "enabled": False}).status_code,
+                400,
+            )
+            self.assertEqual(
+                self.client.post("/admin/api/server-state", json={"server_id": "9", "enabled": False}).status_code,
+                400,
+            )
+            self.assertEqual(
+                self.client.post(
+                    "/admin/api/server-state",
+                    json={"server_id": "1", "enabled": False, "extra": True},
+                ).status_code,
+                400,
+            )
+
+        with patch.object(Interlink, "bot", FakeBot([FakeGuild(1)], ready=False)):
+            response = self.client.post("/admin/api/server-state", json={"server_id": "1", "enabled": False})
+        self.assertEqual(response.status_code, 503)
+
+    def test_server_state_api_disables_and_reenables_without_losing_metadata(self):
+        self.login()
+        fake_bot = FakeBot([FakeGuild(1), FakeGuild(2)], ready=True)
+        data = {
+            "123": {"access_token": "keep-secret"},
+            "_roster_order": ["123"],
+            SERVER_ORDER_KEY: ["2", "1"],
+            "tracked_channels": {"keep": True},
+            "unknown": [1, 2, 3],
+        }
+
+        def update(updater):
+            updater(data)
+            return True
+
+        with patch.object(Interlink, "bot", fake_bot), \
+             patch.object(Interlink.jsonbin_storage, "update_data", side_effect=update):
+            disabled = self.client.post(
+                "/admin/api/server-state",
+                json={"server_id": 2, "enabled": False},
+            )
+            self.assertEqual(disabled.status_code, 200)
+            self.assertEqual(disabled.get_json()["disabled_server_ids"], ["2"])
+            self.assertEqual(Interlink.get_cached_disabled_server_ids()[0], ["2"])
+            self.assertEqual(data[DISABLED_SERVER_IDS_KEY], ["2"])
+            self.assertEqual(data["123"]["access_token"], "keep-secret")
+            self.assertEqual(data["_roster_order"], ["123"])
+            self.assertEqual(data["tracked_channels"], {"keep": True})
+            self.assertEqual(data["unknown"], [1, 2, 3])
+
+            enabled = self.client.post(
+                "/admin/api/server-state",
+                json={"server_id": "2", "enabled": True},
+            )
+            self.assertEqual(enabled.status_code, 200)
+            self.assertEqual(enabled.get_json()["disabled_server_ids"], [])
+            self.assertEqual(Interlink.get_cached_disabled_server_ids()[0], [])
+
+    def test_server_state_api_does_not_update_cache_when_storage_fails(self):
+        self.login()
+        Interlink.set_cached_disabled_server_ids([])
+        with patch.object(Interlink, "bot", FakeBot([FakeGuild(1)], ready=True)), \
+             patch.object(Interlink.jsonbin_storage, "update_data", return_value=False):
+            response = self.client.post(
+                "/admin/api/server-state",
+                json={"server_id": "1", "enabled": False},
+            )
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(Interlink.get_cached_disabled_server_ids()[0], [])
+
+    def test_reorder_api_rejects_disabled_server_ids(self):
+        self.login()
+        Interlink.set_cached_disabled_server_ids(["2"])
+        with patch.object(Interlink, "bot", FakeBot([FakeGuild(1), FakeGuild(2)], ready=True)):
+            response = self.client.post("/admin/api/reorder-servers", json={"order": ["2"]})
+        self.assertEqual(response.status_code, 400)
 
     def test_owner_api_requires_login_and_validates_exact_schema(self):
         response = self.client.post("/admin/api/owner-ids", json={"owner_ids": ["1"]})
@@ -395,6 +521,7 @@ class AdminRoutesTests(unittest.TestCase):
             "1": {"access_token": "must-not-appear", "username": "Agent One"},
             "_roster_order": ["1"],
             SERVER_ORDER_KEY: ["2", "1"],
+            DISABLED_SERVER_IDS_KEY: ["1"],
             OWNER_IDS_KEY: ["111", "222"],
         }
         fake_bot = FakeBot([FakeGuild(1, "One"), FakeGuild(2, "Two")], ready=True)
@@ -405,14 +532,20 @@ class AdminRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('id="roster-list"', html)
         self.assertIn('id="server-list"', html)
+        self.assertIn('id="disabled-server-list"', html)
         self.assertIn('id="owner-list"', html)
         self.assertIn("/admin/api/reorder'", html)
         self.assertIn("/admin/api/reorder-servers'", html)
+        self.assertIn("/admin/api/server-state'", html)
         self.assertIn("/admin/api/owner-ids'", html)
         self.assertIn('["111", "222"]', html)
         self.assertNotIn("must-not-appear", html)
-        server_html = html.split('id="server-list"', 1)[1]
-        self.assertLess(server_html.index(">Two<"), server_html.index(">One<"))
+        active_server_html, disabled_server_html = html.split('id="disabled-server-list"', 1)
+        active_server_html = active_server_html.split('id="server-list"', 1)[1]
+        self.assertIn(">Two<", active_server_html)
+        self.assertNotIn(">One<", active_server_html)
+        self.assertIn(">One<", disabled_server_html)
+        self.assertIn("▶️ Bật lại", disabled_server_html)
 
     def test_dashboard_survives_storage_failure(self):
         self.login()
